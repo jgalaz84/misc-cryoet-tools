@@ -52,6 +52,7 @@ def main():
 	Program to genrate masks around objects in tomograms as a first level of coarse segmentation, to get rid of unnecessary background that may confuse segmentation and/or
 	particle picking/template matching algorithms or simply yield an unnecessarily high number of false positives.
 	Requires a coordinates file in .txt format with at least 4 columns: x y z d, where d is the diameter of the particle centered at x y z coordinates.
+	Alternatively, if only 3 columns are present for the coordinates, a --diameter value is required. 
 	"""
 			
 	parser = EMArgumentParser(usage=usage,version=EMANVERSION)
@@ -59,6 +60,8 @@ def main():
 	parser.add_argument("--apix",type=float,default=None,help="""Default=None. Sampling size of the --input tomogram.""")
 
 	parser.add_argument("--coords", type=str, default=None, help="""Default=None. Path to tomogram to apply mask to.""")
+	
+	parser.add_argument("--diameter", type=int, default=None, help="""Default=None. Diameter value in pixels, required if all particles are homogenous in size and coords file only contains x y z column values.""")
 
 	parser.add_argument("--expand_mask", type=int, default=4, help="""Default=4. Number of pixels to expand mask by so that it is not tight on the structures being masked.""")
 	parser.add_argument("--extract_ptcls", action="store_true", default=False, help="""Default=False. In addition to parsing coords, save particles from the tomogram in a stack.""")
@@ -109,8 +112,10 @@ def main():
 		if options.verbose>5:
 			print("\nFile provided --coords={} contains n={} lines".format(options.coords,len(lines)))
 		
-		#c:eliminate header lines that contain letters, as well as lines that don't contain at least 4 values: x y z d
-		clines = [line for line in lines if not any(c.isalpha() for c in line) and len(line.split())>=4 ]
+		#c:eliminate header lines that contain letters
+		clines = [line for line in lines if not any(c.isalpha() for c in line) ]
+
+		print("\nlen(clines)={}".format(len(clines)))
 		
 		#c:lists to store minor and major axes lengths, as well as calculated volumes
 		majors=[]
@@ -143,7 +148,16 @@ def main():
 			lsplit=line.split()
 			line_length = len(lsplit)
 
-			major=round(float(lsplit[3]),2)
+			major = None 
+			if line_length > 4:
+				major=round(float(lsplit[3]),2)
+			else:
+				try:
+					major = options.diameter/1.0
+				except:
+					print("\nERROR: --diameter required if --coords file contains only x y z values.")
+					sys.exit(1)
+
 			majors.append(major)
 
 			minor=None
@@ -173,15 +187,18 @@ def main():
 				minor = minora #c:if two measurements were present, replace minor with the average of minor and minorp
 				minoras.append(minora)
 			
+			#c:because of the missing wedge, we only have major and minor axes presumably through the central slice of each object; we asssume the axis in z to be the same as 'minor'
+			vol = None
 			if minor:
 				coords_dict.update( { k:{'x':lsplit[0], 'y':lsplit[1], 'z':lsplit[2], 'major':major, 'minor':minor }})
+				vol = (4.0/3.0)*math.pi*major*minor*minor
 			else:
 				coords_dict.update( { k:{'x':lsplit[0], 'y':lsplit[1], 'z':lsplit[2], 'major':major}})
-				minor=major
-
-			#c:because of the missing wedge, we only have major and minor axes presumably through the central slice of each object; we asssume the axis in z to be the same as 'minor'
-			vol = (4.0/3.0)*math.pi*major*minor*minor
-			vols.append(vol)
+				vol = (4.0/3.0)*math.pi*((major/2)**3)
+			if vol:
+				vols.append(vol)
+			else:
+				print("\nWARNING: could not calculate volume for particle at coorinates line={}".format(line))
 
 			k+=1
 
