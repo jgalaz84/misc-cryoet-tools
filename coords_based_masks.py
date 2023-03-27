@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Author: Jesus Galaz-Montoya 11/2022; last modification: 01/2023
+# Author: Jesus Galaz-Montoya 11/2022; last modification: 03/2023
 #
 # This software is issued under a joint BSD/GNU license. You may use the
 # source code in this file under either license. However, note that the
@@ -115,6 +115,16 @@ def main():
 		#c:eliminate header lines that contain letters
 		clines = [line for line in lines if not any(c.isalpha() for c in line) ]
 
+		indexes_to_remove = []
+		for i in range(len(clines)):
+			print(f"\nexamining cline {i} which is\n{clines[i]}\nto determine whether it needs to be removed")
+			if clines[i].isalpha() or len(clines[i])<5:
+				indexes_to_remove.append(i)	
+		
+		for j in indexes_to_remove:
+			prit(f"\nremoving line index {j} which is {clines[j]}")
+			clines.pop(j)
+
 		print("\nlen(clines)={}".format(len(clines)))
 		
 		#c:lists to store minor and major axes lengths, as well as calculated volumes
@@ -145,11 +155,12 @@ def main():
 		#c:loop through the "clean lines" to parse them and populate the empty lists created above
 		k=0
 		for line in clines:
+			print(f"\nexamining clean line {line}")
 			lsplit=line.split()
-			line_length = len(lsplit)
+			line_elements_n = len(lsplit)
 
 			major = None 
-			if line_length > 4:
+			if line_elements_n > 4:
 				major=round(float(lsplit[3]),2)
 			else:
 				try:
@@ -162,11 +173,11 @@ def main():
 
 			minor=None
 
-			if line_length > 4:
+			if line_elements_n > 4:
 				minor=round(float(lsplit[4]),2)
 				minors.append(minor)
 
-			if line_length > 5:
+			if line_elements_n > 5:
 				majorp=round(float(lsplit[5]),2)
 				majorps.append(majorp)
 
@@ -191,10 +202,10 @@ def main():
 			vol = None
 			if minor:
 				coords_dict.update( { k:{'x':lsplit[0], 'y':lsplit[1], 'z':lsplit[2], 'major':major, 'minor':minor }})
-				vol = (4.0/3.0)*math.pi*major*minor*minor
+				vol = (4.0/3.0)*math.pi*( (major/2.0) * (minor/2.0) * (minor/2.0))
 			else:
 				coords_dict.update( { k:{'x':lsplit[0], 'y':lsplit[1], 'z':lsplit[2], 'major':major}})
-				vol = (4.0/3.0)*math.pi*((major/2)**3)
+				vol = (4.0/3.0)*math.pi*((major/2.0)**3)
 			if vol:
 				vols.append(vol)
 			else:
