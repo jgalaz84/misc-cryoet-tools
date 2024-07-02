@@ -60,6 +60,7 @@ def main():
     output_dir = ensure_unique_directory(args.output_dir)
     print(f"Output directory: {output_dir}")
     files = [f for f in os.listdir(args.input_dir) if args.input_string in f and os.path.splitext(f)[-1] in extensions()]
+    files.sort()
     print(f"Files to process: {files}")
     
     images = []
