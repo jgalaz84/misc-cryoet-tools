@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Author: Jesus Galaz-Montoya 08/2019; last modification: jun/2024
+# Author: Jesus Galaz-Montoya 2024; last modification: August/14//2024
 
 import h5py
 import argparse
@@ -8,7 +8,7 @@ import mrcfile
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from scipy.stats import kurtosis, ttest_ind
+from scipy.stats import kurtosis, ttest_ind, mannwhitneyu, shapiro
 from skimage.feature import graycomatrix, graycoprops
 from skimage.measure import shannon_entropy
 from sys import argv
@@ -92,6 +92,42 @@ def process_slices(image_3d, metrics):
         mean = np.mean(slice)
         sigma = np.std(slice)
         if sigma > 0:
+            #slice_normalized = slice.astype(np.uint8) if slice.dtype not in [np.uint8, np.uint16] else slice
+            slice_normalized = (slice * 255).astype(np.uint8) if slice.dtype in [np.float32, np.float64] else slice
+            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
+            feature_values = {
+                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
+                'entropy': shannon_entropy(slice_normalized),
+                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
+                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
+                'energy': graycoprops(glcm, 'energy')[0].mean(),
+                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
+                'mean': mean,
+                'std_dev': sigma
+            }
+            # Append metrics and check for extremes
+            for key, value in feature_values.items():
+                metrics[key].append(value)
+                if value < extremes[key]['min'][1]:
+                    extremes[key]['min'] = (idx, value)
+                if value > extremes[key]['max'][1]:
+                    extremes[key]['max'] = (idx, value)
+        else:
+            print(f"Skipping slice {idx} due to zero standard deviation")
+
+    # Extract slices for extreme values
+    extreme_slices = {key: {'min_slice': image_3d[extremes[key]['min'][0]], 'max_slice': image_3d[extremes[key]['max'][0]]} for key in metrics if extremes[key]['min'][0] is not None and extremes[key]['max'][0] is not None}
+    return extreme_slices
+
+'''
+def process_slices(image_3d, metrics):
+    print('\nAnalyzing slices...')
+    extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
+
+    for idx, slice in enumerate(image_3d):
+        mean = np.mean(slice)
+        sigma = np.std(slice)
+        if sigma > 0:
             slice_normalized = (slice * 255).astype(np.uint8) if slice.dtype in [np.float32, np.float64] else slice
             glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
             feature_values = {
@@ -118,18 +154,66 @@ def process_slices(image_3d, metrics):
     # Extract slices for extreme values
     extreme_slices = {key: {'min_slice': image_3d[extremes[key]['min'][0]], 'max_slice': image_3d[extremes[key]['max'][0]]} for key in metrics if extremes[key]['min'][0] is not None and extremes[key]['max'][0] is not None}
     return extreme_slices
+    '''
 
+def is_normal(data, alpha=0.05):
+    """Check if the data is normally distributed using the Shapiro-Wilk test."""
+    stat, p_value = shapiro(data)
+    return p_value > alpha  # Returns True if data is normal (p-value > alpha)
+
+'''
 def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, metric_keys, filename):
     print("\nCreating violin plots for", filename)
-    num_metrics = len(metric_keys)
+    valid_metrics = []
+    p_values = []
+    significance_labels = []
+
+    # Determine valid metrics
+    for key in metric_keys:
+        data1, data2 = np.array(metrics1[key]), np.array(metrics2[key])
+        
+        # Skip if data contains NaN values
+        if np.isnan(data1).all() or np.isnan(data2).all():
+            print(f"Skipping {key} due to invalid data")
+            continue
+        
+        # Check normality and select the appropriate test
+        normal1 = is_normal(data1)
+        normal2 = is_normal(data2)
+
+        if normal1 and normal2:
+            stat, p_value = ttest_ind(data1, data2)
+        else:
+            stat, p_value = mannwhitneyu(data1, data2)
+
+        # Skip if p-value is NaN
+        if np.isnan(p_value):
+            print(f"Skipping {key} due to NaN p-value")
+            continue
+
+        valid_metrics.append(key)
+        p_values.append(p_value)
+        
+        # Determine significance label
+        if p_value < 0.001:
+            significance_labels.append("***")
+        elif p_value < 0.01:
+            significance_labels.append("**")
+        elif p_value < 0.05:
+            significance_labels.append("*")
+        else:
+            significance_labels.append("ns")
+
+    num_metrics = len(valid_metrics)
     fig, axes = plt.subplots(1, num_metrics, figsize=(4 * num_metrics, 8))  # Increase height for better layout
 
     color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Color palette for distinction
 
-    for i, key in enumerate(metric_keys):
-        ax = axes[i]
+    # Plot valid metrics
+    for i, key in enumerate(valid_metrics):
+        ax = axes[i] if num_metrics > 1 else axes  # Handle case of single subplot
         data1, data2 = np.array(metrics1[key]), np.array(metrics2[key])
-        
+
         # Plot violin plot for Dataset 1
         parts1 = ax.violinplot(data1, positions=[1], showmeans=False, showmedians=False, showextrema=False)
         for pc in parts1['bodies']:
@@ -166,7 +250,8 @@ def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices
         ax.vlines(2, min_val2, max_val2, color='black', linestyle='-', lw=2)  # Min-Max range (Black)
         ax.vlines(2, quartile1, quartile3, color='black', linestyle='-', lw=5)  # Interquartile range (Black)
 
-        ax.set_title(f'{key} (p={ttest_ind(data1, data2).pvalue:.4f})')
+        # Display numerical p-value and significance level
+        ax.set_title(f'{key} (p={p_values[i]:.4f}, {significance_labels[i]})')
         ax.set_xticks([1, 2])
         ax.set_xticklabels(['Dataset 1', 'Dataset 2'])
 
@@ -192,65 +277,174 @@ def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices
     plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, filename),bbox_inches='tight', pad_inches=0.2)
+    plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
     print(f"Saved {filename} successfully.")
 
+    # Save p-values to a text file
+    with open(os.path.join(output_dir, filename.replace('.png', '_pvalues.txt')), 'w') as f:
+        for key, p_value, label in zip(valid_metrics, p_values, significance_labels):
+            f.write(f'{key}: p={p_value:.4f}, {label}\n')
 '''
-kinda WORKS
-def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, metric_keys, filename):
+
+def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, metric_keys, filename, data_labels=None):
     print("\nCreating violin plots for", filename)
-    num_metrics = len(metric_keys)
-    fig, axes = plt.subplots(1, num_metrics, figsize=(4 * num_metrics, 6))  # Adjust size as needed
+    valid_metrics = []
+    p_values = []
+    significance_labels = []
 
-    color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Fewer colors, cycling through
+    # Set default data labels if none provided
+    if data_labels is None:
+        data_labels = ['Dataset 1', 'Dataset 2']
+    else:
+        data_labels = data_labels.split(',')
 
-    for i, key in enumerate(metric_keys):
-        ax = axes[i]
+    # Determine valid metrics
+    for key in metric_keys:
         data1, data2 = np.array(metrics1[key]), np.array(metrics2[key])
         
+        # Skip if data contains NaN values
+        if np.isnan(data1).all() or np.isnan(data2).all():
+            print(f"Skipping {key} due to invalid data")
+            continue
+        
+        # Check normality and select the appropriate test
+        normal1 = is_normal(data1)
+        normal2 = is_normal(data2)
+
+        if normal1 and normal2:
+            stat, p_value = ttest_ind(data1, data2)
+        else:
+            stat, p_value = mannwhitneyu(data1, data2)
+
+        # Skip if p-value is NaN
+        if np.isnan(p_value):
+            print(f"Skipping {key} due to NaN p-value")
+            continue
+
+        valid_metrics.append(key)
+        p_values.append(p_value)
+        
+        # Determine significance label
+        if p_value < 0.001:
+            significance_labels.append("***")
+        elif p_value < 0.01:
+            significance_labels.append("**")
+        elif p_value < 0.05:
+            significance_labels.append("*")
+        else:
+            significance_labels.append("ns")
+
+    num_metrics = len(valid_metrics)
+    
+    # If no valid metrics, print a warning and exit the function
+    if num_metrics == 0:
+        print("No valid metrics to plot.")
+        return
+
+    fig, axes = plt.subplots(1, num_metrics, figsize=(4 * num_metrics, 8))  # Increase height for better layout
+
+    color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Color palette for distinction
+
+    # Plot valid metrics
+    for i, key in enumerate(valid_metrics):
+        ax = axes[i] if num_metrics > 1 else axes  # Handle case of single subplot
+        data1, data2 = np.array(metrics1[key]), np.array(metrics2[key])
+
+        # Adjusting y-limits to start from 0 or the minimum value PLUS PADDING
+        min_val1 = np.min(data1)
+        max_val1 = np.max(data1)
+        min_val2 = np.min(data2)
+        max_val2 = np.max(data2)
+
+        global_min = min(0, np.min([min_val1, min_val2]))
+        global_max = max(max_val1, max_val2)
+
+        global_min_padded = global_min - global_min*0.1
+        if not global_min:
+            global_min_padded = -0.1*global_max
+        global_max_padded = global_max * 1.1
+
+        ax.set_ylim(global_min_padded, global_max_padded)
+
+        # Plot violin plot for Dataset 1
         parts1 = ax.violinplot(data1, positions=[1], showmeans=False, showmedians=False, showextrema=False)
         for pc in parts1['bodies']:
             pc.set_facecolor(color_palette[i % len(color_palette)])
             pc.set_alpha(1)
+            pc.set_edgecolor('black')
 
+        # Custom additions for quartiles, medians, and extrema for Dataset 1
+        quartile1, med1, quartile3 = np.percentile(data1, [25, 50, 75])
+        mean1 = np.mean(data1)
+
+        ax.scatter(1, med1, color='red', zorder=3)  # Median (Red)
+        ax.scatter(1, mean1, color='white', zorder=3)  # Mean (White)
+        ax.vlines(1, min_val1, max_val1, color='black', linestyle='-', lw=2)  # Min-Max range (Black)
+        ax.vlines(1, quartile1, quartile3, color='black', linestyle='-', lw=5)  # Interquartile range (Black)
+        
+        # Label the distribution as Gaussian or Non-Gaussian for Dataset 1
+        label1 = 'Gaussian' if normal1 else 'Non-Gaussian'
+        ax.text(1, global_max_padded, label1, ha='center', va='bottom', fontsize=10, color='black')
+
+        # Plot violin plot for Dataset 2
         parts2 = ax.violinplot(data2, positions=[2], showmeans=False, showmedians=False, showextrema=False)
         for pc in parts2['bodies']:
             pc.set_facecolor(color_palette[i % len(color_palette)])
             pc.set_alpha(0.5)
+            pc.set_edgecolor('black')
 
-        # Adding mean and median indicators
-        ax.scatter(1, np.mean(data1), color='red', s=30, zorder=3)  # Red star for mean
-        ax.scatter(1, np.median(data1), color='white', s=30, edgecolor='black', zorder=3)  # White circle for median
-        ax.scatter(2, np.mean(data2), color='red', s=30, zorder=3)
-        ax.scatter(2, np.median(data2), color='white', s=30, edgecolor='black', zorder=3)
+        # Custom additions for quartiles, medians, and extrema for Dataset 2
+        quartile1, med2, quartile3 = np.percentile(data2, [25, 50, 75])
+        mean2 = np.mean(data2)
 
-        ax.set_title(f'{key} (p={ttest_ind(data1, data2).pvalue:.3e})')
+        ax.scatter(2, med2, color='red', zorder=3)  # Median (Red)
+        ax.scatter(2, mean2, color='white', zorder=3)  # Mean (White)
+        ax.vlines(2, min_val2, max_val2, color='black', linestyle='-', lw=2)  # Min-Max range (Black)
+        ax.vlines(2, quartile1, quartile3, color='black', linestyle='-', lw=5)  # Interquartile range (Black)
+
+        # Label the distribution as Gaussian or Non-Gaussian for Dataset 2
+        label2 = 'Gaussian' if normal2 else 'Non-Gaussian'
+        ax.text(2, global_max_padded, label2, ha='center', va='bottom', fontsize=10, color='black')
+
+        # Display numerical p-value and significance level
+        ax.set_title(f'{key} (p={p_values[i]:.4f}, {significance_labels[i]})', fontsize=12, pad=30)
         ax.set_xticks([1, 2])
-        ax.set_xticklabels(['Dataset 1', 'Dataset 2'])
+        ax.set_xticklabels(data_labels)
 
-        # Add extreme slice images correctly aligned with the plots
-        ax_min1 = fig.add_axes([0.07 + i * 0.25, 0.02, 0.1, 0.1])
+        # Adjusting slice image positions
+        offset = 0.15  # Offset to ensure no overlap
+        ax_min1 = fig.add_axes([0.05 + i * (1/num_metrics), -0.1, 0.1, 0.1])
         ax_min1.imshow(extreme_slices1[key]['min_slice'], cmap='gray')
         ax_min1.axis('off')
 
-        ax_max1 = fig.add_axes([0.07 + i * 0.25, 0.88, 0.1, 0.1])
+        ax_max1 = fig.add_axes([0.05 + i * (1/num_metrics), 1.02, 0.1, 0.1])
         ax_max1.imshow(extreme_slices1[key]['max_slice'], cmap='gray')
         ax_max1.axis('off')
 
-        ax_min2 = fig.add_axes([0.17 + i * 0.25, 0.02, 0.1, 0.1])
+        ax_min2 = fig.add_axes([0.15 + i * (1/num_metrics), -0.1, 0.1, 0.1])
         ax_min2.imshow(extreme_slices2[key]['min_slice'], cmap='gray')
         ax_min2.axis('off')
 
-        ax_max2 = fig.add_axes([0.17 + i * 0.25, 0.88, 0.1, 0.1])
+        ax_max2 = fig.add_axes([0.15 + i * (1/num_metrics), 1.02, 0.1, 0.1])
         ax_max2.imshow(extreme_slices2[key]['max_slice'], cmap='gray')
         ax_max2.axis('off')
 
+    # Adjust the subplot layout to prevent overlap and ensure correct positioning
+    plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
+
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, filename))
+    plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
     print(f"Saved {filename} successfully.")
-'''
+
+    # Save p-values to a text file
+    with open(os.path.join(output_dir, filename.replace('.png', '_pvalues.txt')), 'w') as f:
+        for key, p_value, label in zip(valid_metrics, p_values, significance_labels):
+            f.write(f'{key}: p={p_value:.4f}, {label}\n')
+
+
+
 
 def save_raw_data(metrics1, metrics2, output_dir):
     """Save raw data to text files for each metric."""
@@ -283,6 +477,7 @@ def main():
     parser = argparse.ArgumentParser(description="Process image files to compute metrics.")
     parser.add_argument('--input', required=True, help="Comma-separated file paths for one or two image files.")
     parser.add_argument('--output_dir', default="molstats", help="Directory to save the outputs.")
+    parser.add_argument('--data_labels', default=None, help="Comma-separated labels for the datasets.")
     args = parser.parse_args()
 
     input_files = args.input.split(',')
@@ -307,10 +502,10 @@ def main():
             other_metrics_keys = ['kurtosis', 'entropy', 'mean', 'std_dev']
 
             # Plotting Haralick features
-            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, haralick_keys, "haralick_features.png")
+            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, haralick_keys, "haralick_features.png", data_labels=args.data_labels)
 
-            # Plotting other metrics
-            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, other_metrics_keys, "other_metrics.png")
+            # Plotting other metric
+            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, other_metrics_keys, "other_metrics.png", data_labels=args.data_labels)
         elif len(input_files) == 1:
             # Load and process data for the single file
             image_3d, metrics, extreme_slices = load_and_process_data(input_files[0])
