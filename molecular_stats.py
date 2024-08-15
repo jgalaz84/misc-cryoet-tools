@@ -118,7 +118,7 @@ def process_slices(image_3d, metrics):
     # Extract slices for extreme values
     extreme_slices = {key: {'min_slice': image_3d[extremes[key]['min'][0]], 'max_slice': image_3d[extremes[key]['max'][0]]} for key in metrics if extremes[key]['min'][0] is not None and extremes[key]['max'][0] is not None}
     return extreme_slices
-    
+
 
 def is_normal(data, alpha=0.05):
     """Check if the data is normally distributed using the Shapiro-Wilk test."""
@@ -199,16 +199,17 @@ def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices
         global_min = min(min_val1, min_val2)
         global_max = max(max_val1, max_val2)
 
-        global_min_padded = global_min - global_min*0.1
-        if float(global_min) < 0.0:
-            global_min_padded = global_min - math.fabs(global_min*0.1)
+        datarange = global_max - global_min
+        global_min_padded = global_min - datarange*0.1
+        #if float(global_min) < 0.0:
+        #    global_min_padded = global_min - np.abs(datarange*0.1)
 
-        if not global_min:
-            global_min_padded = -0.1*global_max
+        #if not global_min:
+        #    global_min_padded = -0.1*datarange
         
-        global_max_padded = global_max * 1.1
-        if float(global_max) < 0.0:
-            global_max_padded = global_max + math.fabs(global_max*0.1)
+        global_max_padded = global_max + datarange*0.1
+        #if float(global_max) < 0.0:
+        #    global_max_padded = global_max + np.abs(global_max*0.1)
 
         ax.set_ylim(global_min_padded, global_max_padded)
 
