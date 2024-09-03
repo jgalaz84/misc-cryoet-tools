@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Author: Jesus Galaz-Montoya 2024; last modification: August/14//2024
+# Author: Jesus Galaz-Montoya 2024; last modification: Sep/03/2024
 
 import h5py
 import argparse
