@@ -11,7 +11,6 @@ from matplotlib.ticker import MaxNLocator
 from scipy.stats import kurtosis, ttest_ind, mannwhitneyu, shapiro
 from skimage.feature import graycomatrix, graycoprops
 from skimage.measure import shannon_entropy
-#from sys import argv
 import sys
 import os
 import logging
@@ -27,43 +26,6 @@ def list_hdf5_paths(hdf5_file):
     with h5py.File(hdf5_file, 'r') as file:
         file.visititems(visitor_func)
     return paths
-
-'''
-OLD
-def load_image_data(file_path):
-    """ Load 3D image data from a file path, treating each dataset path as a separate 3D volume. """
-    print(f"Attempting to load data from {file_path}")
-    file_extension = os.path.splitext(file_path)[1].lower()
-    
-    if file_extension in ['.hdf', '.h5']:
-        with h5py.File(file_path, 'r') as file:
-            paths = list_hdf5_paths(file_path)
-            print(f"Available dataset paths in {file_path}: {paths}")
-            
-            # Load each dataset path as a separate 3D image
-            image_3d_stack = []
-            for path in paths:
-                if path.endswith('/image'):
-                    print(f"Loading dataset at path: {path}")
-                    image_3d = np.array(file[path])
-                    print(f"Loaded data shape: {image_3d.shape}")
-                    
-                    # Ensure each dataset is a 3D volume
-                    if len(image_3d.shape) != 3:
-                        raise ValueError(f"Expected 3D data at {path}, but got {image_3d.shape}")
-                    
-                    image_3d_stack.append(image_3d)
-            
-            # Stack all 3D volumes into a single array along a new axis
-            return np.stack(image_3d_stack)
-    
-    elif file_extension == '.mrc':
-        with mrcfile.open(file_path, permissive=True) as mrc:
-            return mrc.data
-    
-    else:
-        raise ValueError(f"Unsupported file format: {file_extension}")
-'''
 
 def load_and_process_data(file_path):
     """Helper function to load 3D image data (or a stack of 3D volumes) and calculate metrics."""
@@ -157,97 +119,6 @@ def calculate_metrics_for_images(image_3d):
     extreme_slices = process_slices(image_3d, metrics)
     return metrics, extreme_slices
 
-'''
-OLD
-def process_slices(image_3d, metrics):
-    print('\nAnalyzing slices...')
-    extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
-
-    for idx, slice in enumerate(image_3d):
-        mean = np.mean(slice)
-        sigma = np.std(slice)
-        if sigma > 0:
-            #slice_normalized = slice.astype(np.uint8) if slice.dtype not in [np.uint8, np.uint16] else slice
-            slice_normalized = (slice * 255).astype(np.uint8) if slice.dtype in [np.float32, np.float64] else slice
-            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
-            feature_values = {
-                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
-                'entropy': shannon_entropy(slice_normalized),
-                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
-                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
-                'energy': graycoprops(glcm, 'energy')[0].mean(),
-                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
-                'mean': mean,
-                'std_dev': sigma
-            }
-            # Append metrics and check for extremes
-            for key, value in feature_values.items():
-                metrics[key].append(value)
-                if value < extremes[key]['min'][1]:
-                    extremes[key]['min'] = (idx, value)
-                if value > extremes[key]['max'][1]:
-                    extremes[key]['max'] = (idx, value)
-        else:
-            print(f"Skipping slice {idx} due to zero standard deviation")
-
-    # Extract slices for extreme values
-    extreme_slices = {key: {'min_slice': image_3d[extremes[key]['min'][0]], 'max_slice': image_3d[extremes[key]['max'][0]]} for key in metrics if extremes[key]['min'][0] is not None and extremes[key]['max'][0] is not None}
-    return extreme_slices
-'''
-
-
-'''
-OLD
-def process_slices(image_3d, metrics):
-    """Process all slices from a 3D volume and calculate statistical metrics."""
-    print(f'\nAnalyzing slices...')
-    print(f"Shape of image_3d in process_slices: {image_3d.shape}")  # Add this line to check the shape
-    
-    # Ensure image_3d is 3D
-    if len(image_3d.shape) != 3:
-        raise ValueError(f"Expected 3D data, but got {len(image_3d.shape)}D data: {image_3d.shape}")
-    
-    extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
-    
-    # Number of slices in the z-dimension of the 3D volume
-    num_slices = image_3d.shape[0]  # Assuming the first dimension corresponds to the slices
-    
-    for idx in range(num_slices):
-        slice_2d = image_3d[idx, :, :]  # Extract the 2D slice from the 3D volume (z-axis)
-        print(f"Processing slice {idx}, slice shape: {slice_2d.shape}")  # Add this line for debugging
-        mean = np.mean(slice_2d)
-        sigma = np.std(slice_2d)
-
-        if sigma > 0:
-            # Normalize the 2D slice (assuming float32/float64 data requires scaling)
-            slice_normalized = (slice_2d * 255).astype(np.uint8) if slice_2d.dtype in [np.float32, np.float64] else slice_2d
-            
-            # Calculate GLCM for the 2D slice
-            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
-            
-            feature_values = {
-                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
-                'entropy': shannon_entropy(slice_normalized),
-                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
-                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
-                'energy': graycoprops(glcm, 'energy')[0].mean(),
-                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
-                'mean': mean,
-                'std_dev': sigma
-            }
-            
-            # Append metrics and check for extremes
-            for key, value in feature_values.items():
-                metrics[key].append(value)
-                if value < extremes[key]['min'][1]:
-                    extremes[key]['min'] = (idx, value)
-                if value > extremes[key]['max'][1]:
-                    extremes[key]['max'] = (idx, value)
-        else:
-            print(f"Skipping slice {idx} due to zero standard deviation")
-
-    return extremes
-'''
 
 def process_slices(image_3d, metrics):
     """Process all slices from a 3D volume and calculate statistical metrics."""
@@ -297,13 +168,6 @@ def process_slices(image_3d, metrics):
     
     print()  # Move to the next line after processing all slices
     return extremes
-
-
-
-
-
-
-
 
 
 def is_normal(data, alpha=0.05):
@@ -496,60 +360,6 @@ def plot_metrics(metrics, output_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "metrics_distributions.png"))
     plt.close(fig)
-
-'''
-OLD
-def load_and_process_data(file_path):
-    """ Helper function to load image data and calculate metrics. """
-    image_3d = load_image_data(file_path)
-    if image_3d is not None:
-        metrics, extreme_slices = calculate_metrics_for_images(image_3d)
-        return image_3d, metrics, extreme_slices
-    else:
-        raise Exception(f"Failed to load image data from {file_path}")
-'''
-
-'''
-PROGRESS
-def load_and_process_data(file_path):
-    """Helper function to load image data and calculate metrics across all 3D volumes in a stack."""
-    image_3d_stack = load_image_data(file_path)  # Load the entire stack of 3D volumes
-    num_volumes = image_3d_stack.shape[0]  # First dimension of the stack is the number of volumes
-    print(f"A total of N={num_volumes} 3D volumes found in stack={file_path}")
-    
-    global_metrics = {
-        'kurtosis': [], 'entropy': [], 'contrast': [], 'homogeneity': [],
-        'energy': [], 'correlation': [], 'mean': [], 'std_dev': []
-    }
-    global_extreme_slices = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in global_metrics}
-
-    # Process the 3D volumes in the stack
-    for vol_idx in range(num_volumes):
-        image_3d = image_3d_stack[vol_idx]  # Extract each 3D volume
-        print(f"Calculating stats for image n={vol_idx+1}/{num_volumes} in stack={file_path}")
-
-        # Calculate metrics for the current 3D volume
-        metrics, extreme_slices = calculate_metrics_for_images(image_3d)
-
-        # Append the metrics from each volume to global metrics
-        for key in global_metrics:
-            global_metrics[key].extend(metrics[key])
-        
-        # Update global extremes (min/max slices) across all volumes
-        for key in global_metrics:
-            if extreme_slices[key]['min'][1] < global_extreme_slices[key]['min'][1]:
-                global_extreme_slices[key]['min'] = extreme_slices[key]['min']
-            if extreme_slices[key]['max'][1] > global_extreme_slices[key]['max'][1]:
-                global_extreme_slices[key]['max'] = extreme_slices[key]['max']
-
-    # Extract the global extreme slices across the entire stack
-    final_extreme_slices = {key: {'min_slice': image_3d_stack[global_extreme_slices[key]['min'][0]],
-                                  'max_slice': image_3d_stack[global_extreme_slices[key]['max'][0]]}
-                            for key in global_metrics}
-    
-    return global_metrics, final_extreme_slices
-'''
-
 
 
 def main():
