@@ -1,83 +1,182 @@
 import numpy as np
 import mrcfile
 import argparse
-
-def read_mrc_file(mrc_filename):
-    """
-    Reads the MRC file and returns the data as a 3D numpy array.
-    
-    Parameters:
-        mrc_filename (str): Path to the MRC file.
-    
-    Returns:
-        numpy.ndarray: The 3D array of frames from the MRC file.
-    """
-    
-    print(f'\nreading {mrc_filename}')
-    with mrcfile.open(mrc_filename, permissive=True) as mrc:
-        mrc_data = mrc.data.copy()  # Copying the data into memory
-
-    print(f'\nread {mrc_filename}')
-    return mrc_data
-
-def average_frames(mrc_data, n_average):
-    """
-    Averages frames in blocks of n_average.
-    
-    Parameters:
-        mrc_data (numpy.ndarray): The 3D array of shape (n_frames, height, width).
-        n_average (int): Number of frames to average together.
-    
-    Returns:
-        numpy.ndarray: The 3D array of averaged frames.
-    """
-
-    n_frames, height, width = mrc_data.shape
-    print(f'\naveraging n={n_frames} SUBframes of size {width} x {height}')
-    n_output_frames = n_frames // n_average
-    print(f'\ninto these many FRAMES {n_output_frames}')
-    averaged_frames = np.zeros((n_output_frames, height, width), dtype=np.float32)
-    
-    for i in range(n_output_frames):
-        print(f'\nworking on output_frame {i}')
-        start_idx = i * n_average
-        end_idx = start_idx + n_average
-        averaged_frames[i] = np.mean(mrc_data[start_idx:end_idx], axis=0)
-    
-    return averaged_frames
-
-def save_to_mrc(averaged_frames, output_filename):
-    """
-    Saves the averaged frames to an MRC file.
-    
-    Parameters:
-        averaged_frames (numpy.ndarray): The 3D array of averaged frames.
-        output_filename (str): The filename to save the MRC file as.
-    """
-    with mrcfile.new(output_filename, overwrite=True) as mrc:
-        mrc.set_data(averaged_frames)
-        mrc.update_header_from_data()
+from EMAN2 import *
+from EMAN2_utils import *
 
 def main():
     parser = argparse.ArgumentParser(description="Average MRC frames and save to a new MRC file.")
+    parser.add_argument("--compressbits", type=int, help="HDF only. Bits to keep for compression. -1 for no compression", default=-1)
     parser.add_argument("--input", help="Input MRC file")
-    parser.add_argument("--output", default=None, help="Output MRC file")
-    parser.add_argument("--n_average", type=int, default=10, help="Number of frames to average together (default: 10)")
+    parser.add_argument("--outmode", type=str, default="float", help="All EMAN2 programs write images with 4-byte floating point values by default. You can specify an alternate format (float, int8, int16, etc.).")
+    parser.add_argument("--output", default=None, help="Default=None. Output MRC file")
+    parser.add_argument("--path", default='mrc_frames', help="Directory to store converted files. Default=mrc_frames_00")
+    parser.add_argument("--n_final", type=int, default=10, help="Number of frames to have in the new mrc or hdf stack; e.g., if EER frames are 100, and --n_final is 10, then each 10 EER frames will be averaged together. Remainder frames will be averaged into the last new frame.")
     
-    args = parser.parse_args()
+    eer_input_group = parser.add_mutually_exclusive_group()
+    eer_input_group.add_argument("--eer2x", action="store_true", help="Render EER file on 8k grid.")
+    eer_input_group.add_argument("--eer4x", action="store_true", help="Render EER file on 16k grid.")
 
-    # Read MRC file
-    mrc_data = read_mrc_file(args.input)
+    options = parser.parse_args()
 
-    if args.output is None:
-        args.output = args.input.replace(".mrc", "_averaged.mrc")
+    if options.input[-4:] != ".eer":
+        print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
+        sys.exit(1)
 
-    # Average frames
-    averaged_frames = average_frames(mrc_data, args.n_average)
+    if options.compressbits >= 0 and not options.output.endswith(".hdf"):
+        print(f'\nERROR: --compressbits requires .hdf output. Current file has extension={os.path.splitext(options.output)[-1]}')
+        sys.exit(1)
 
-    # Save to MRC file
-    save_to_mrc(averaged_frames, args.output)
-    print(f"Saved averaged frames to {args.output}")
+    img_type = IMAGE_UNKNOWN
+    if options.eer2x:
+        img_type = IMAGE_EER2X
+    elif options.eer4x:
+        img_type = IMAGE_EER4X
+
+    # Read EER file
+    n_eer = EMUtil.get_image_count(options.input)
+    
+    avg = EMData()
+    
+    out_mode = 'float'
+    out_type = EMUtil.get_image_ext_type("mrc")  # default to mrc
+    not_swap = True  # typically not needed for mrc or hdf
+
+    if options.output is None:
+        options.output = options.input.replace(".eer", "_reduced.mrc")
+
+    if options.output.endswith(".mrc"):
+        out_mode = file_mode_map["float"]  # or adjust to int16, int8 if needed
+    elif options.output.endswith(".hdf"):
+        out_type = EMUtil.get_image_ext_type("hdf")
+        out_mode = file_mode_map["float"]  # or another format if needed
+    else:
+        raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
+
+    frames_per_final = n_eer // options.n_final  # how many input frames per final frame
+    remainder_frames = n_eer % options.n_final   # remainder frames to handle at the end
+
+    for j in range(0, options.n_final):
+        print(f'\nWorking on frame j={j+1}/{options.n_final}')
+
+        # Adjust number of frames in the last iteration if there's a remainder
+        if j == options.n_final - 1:
+            upper_limit = frames_per_final + remainder_frames
+        else:
+            upper_limit = frames_per_final
+
+        print(f'Averaging {upper_limit} frames for final frame {j+1}')
+
+        for i in range(upper_limit):
+            img_indx = j * frames_per_final + i  # Correctly calculate the frame index
+            d = EMData()
+            d.read_image(options.input, img_indx, False, None, False, img_type)
+            print(f'Read image i={i+1}/{upper_limit} for final frame {j+1}, img_indx={img_indx}')
+
+            if i == 0:
+                avg = d.copy()
+            else:
+                avg *= i  # Scale by the number of images averaged so far
+                avg += d
+                avg /= (i + 1)
+
+        if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
+            avg.write_compressed(options.output, j, options.compressbits, nooutliers=True)
+        else:
+            avg.write_image(options.output, j, out_type, False, None, out_mode, not_swap)
+
+        print(f"Saved averaged frames to {options.output} at index {j}")
+    
+    print('\nDONE')
 
 if __name__ == "__main__":
     main()
+
+
+
+'''
+ORIG
+def main():
+    parser = argparse.ArgumentParser(description="Average MRC frames and save to a new MRC file.")
+    parser.add_argument("--compressbits", type=int,help="HDF only. Bits to keep for compression. -1 for no compression",default=-1)
+    #parser.add_argument("--exclude_n", default=0, help="Default=0. Number of frames to exclude from the beginning of the eer stack.")
+    parser.add_argument("--input", help="Input MRC file")
+    parser.add_argument("--outmode", type=str, default="float", help="All EMAN2 programs write images with 4-byte floating point values when possible by default. This allows specifying an alternate format when supported (float, int8, int16, int32, uint8, uint16, uint32). Values are rescaled to fill MIN-MAX range.")
+    parser.add_argument("--output", default=None, help="Default=None. Output MRC file")
+    parser.add_argument("--path", default='mrc_frames', help="Numbered directory where to store converted files. Default=mrc_frames_00")
+    parser.add_argument("--n_final", type=int, default=10, help="Number of frames to have in the new mrc or hdf stack; for example, if eer frames are 100, and --n_final is 10, then each 10 eer frames will be averaged together. Remainder frames will be averaged into the last new frame.")
+    
+    eer_input_group = parser.add_mutually_exclusive_group()
+    eer_input_group.add_argument("--eer2x", action="store_true", help="Render EER file on 8k grid.")
+    eer_input_group.add_argument("--eer4x", action="store_true", help="Render EER file on 16k grid.")
+
+    options = parser.parse_args()
+
+    if options.input[-4:] != ".eer":
+        print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
+        sys.exit(1)
+
+    if options.compressbits>=0 and not options.output.endswith(".hdf"):
+        print(f'\nERROR: --compressbits requires .hdf output. Current file has extension={os.path.splitext(options.output)[-1]}')
+        sys.exit(1)
+
+    img_type = IMAGE_UNKNOWN 
+    if options.eer2x:
+        img_type = IMAGE_EER2X
+    elif options.eer4x:
+        img_type = IMAGE_EER4X
+
+    # Read EER file
+    n_eer=EMUtil.get_image_count(options.input)
+    
+    avg = EMData()
+    
+    out_mode = 'float'
+    out_type = EMUtil.get_image_ext_type("mrc") #default to mrc
+    not_swap = True #presumably typically not needed for mrc or hdf
+
+    if options.output is None:
+        options.output = options.input.replace(".eer", "_reduced.mrc")
+
+    if options.output.endswith(".mrc"):
+        out_mode = file_mode_map["float"]  # or adjust to int16, int8 if needed
+    elif options.output.endswith(".hdf"):
+        out_type = EMUtil.get_image_ext_type("hdf")
+        out_mode = file_mode_map["float"]  # or another format if needed
+    else:
+        raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
+
+    upper_limit = n_eer//n_final
+    remainder_frames = n_eer%n_final
+    for j in range(0, n_final):
+        print(f'\nworking on frame j={j+1}/{n_final}')
+        
+        if j == n_final - 1: #this is the last iteration; remainder images need to go into the last average
+            upper_limit = n_final + remainder_frames
+        print(f'which will be an average of n={upper_limit} frames')
+
+        for i in range(0,upper_limit):
+            img_indx = (i+1)*(j+1) - 1
+            d = EMData()
+            d.read_image(options.input, img_indx, False, None, False, img_type)
+            print(f'read image i={i} for frame j={j} which corresponds to img_indx={img_indx}\n')
+            if i == 0: 
+                avg = d.copy()
+            elif i > 0:
+                avg *= i #scale by the number of images averaged so far
+                avg += d
+                avg/=(i+1)
+   
+        if options.compressbits>=0 and out_type == EMUtil.get_image_ext_type("hdf"):
+            #avg.write_compressed(options.output,-1, options.compressbits,nooutliers=True) #only supported for hdf
+            avg.write_compressed(options.output,j, options.compressbits,nooutliers=True)
+        else:
+            #avg.write_image(options.output, -1, out_type, False, None, out_mode, not_swap)
+            avg.write_image(options.output, j, out_type, False, None, out_mode, not_swap)
+    
+        print(f"Saved averaged frames to {options.output} index j={j}")
+    print('\nDONE')
+
+if __name__ == "__main__":
+    main()
+'''
