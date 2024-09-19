@@ -3,28 +3,34 @@ import mrcfile
 import argparse
 from EMAN2 import *
 from EMAN2_utils import *
+import os
 
 def main():
     parser = argparse.ArgumentParser(description="Average MRC frames and save to a new MRC file.")
     parser.add_argument("--compressbits", type=int, help="HDF only. Bits to keep for compression. -1 for no compression", default=-1)
-    parser.add_argument("--input", help="Input MRC file")
+    parser.add_argument("--input", help="Input EER file; must end with .eer extension.")
     parser.add_argument("--outmode", type=str, default="float", help="All EMAN2 programs write images with 4-byte floating point values by default. You can specify an alternate format (float, int8, int16, etc.).")
     parser.add_argument("--output", default=None, help="Default=None. Output MRC file")
     parser.add_argument("--path", default='mrc_frames', help="Directory to store converted files. Default=mrc_frames_00")
     parser.add_argument("--n_final", type=int, default=10, help="Number of frames to have in the new mrc or hdf stack; e.g., if EER frames are 100, and --n_final is 10, then each 10 EER frames will be averaged together. Remainder frames will be averaged into the last new frame.")
-    
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+   
     eer_input_group = parser.add_mutually_exclusive_group()
     eer_input_group.add_argument("--eer2x", action="store_true", help="Render EER file on 8k grid.")
     eer_input_group.add_argument("--eer4x", action="store_true", help="Render EER file on 16k grid.")
 
     options = parser.parse_args()
 
-    if options.input[-4:] != ".eer":
+    if os.path.splitext(options.input)[-1].lower() != ".eer":
         print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
         sys.exit(1)
 
     if options.compressbits >= 0 and not options.output.endswith(".hdf"):
         print(f'\nERROR: --compressbits requires .hdf output. Current file has extension={os.path.splitext(options.output)[-1]}')
+        sys.exit(1)
+
+    if options.n_final <= 0:
+        print("Error: --n_final must be greater than 0.")
         sys.exit(1)
 
     img_type = IMAGE_UNKNOWN
@@ -53,26 +59,34 @@ def main():
     else:
         raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
 
+    options = makepath(options,'sptsim')
+
+    # Determine the number of frames to average per final frame
     frames_per_final = n_eer // options.n_final  # how many input frames per final frame
     remainder_frames = n_eer % options.n_final   # remainder frames to handle at the end
 
     for j in range(0, options.n_final):
-        print(f'\nWorking on frame j={j+1}/{options.n_final}')
+        if options.verbose:
+            print(f'\nWorking on frame j={j+1}/{options.n_final}')
 
         # Adjust number of frames in the last iteration if there's a remainder
+        # (For the last frame, average both the regular number of frames and any remaining frames from the division ensuring  all  frames are used).
         if j == options.n_final - 1:
             upper_limit = frames_per_final + remainder_frames
         else:
             upper_limit = frames_per_final
 
-        print(f'Averaging {upper_limit} frames for final frame {j+1}')
+        if options.verbose:
+            print(f'Averaging {upper_limit} frames for final frame {j+1}')
 
         for i in range(upper_limit):
             img_indx = j * frames_per_final + i  # Correctly calculate the frame index
             d = EMData()
             d.read_image(options.input, img_indx, False, None, False, img_type)
-            print(f'Read image i={i+1}/{upper_limit} for final frame {j+1}, img_indx={img_indx}')
+            if options.verbose:
+                print(f'Read image i={i+1}/{upper_limit} for final frame {j+1}, img_indx={img_indx}')
 
+            #RUNNING AVERAGE
             if i == 0:
                 avg = d.copy()
             else:
@@ -80,12 +94,20 @@ def main():
                 avg += d
                 avg /= (i + 1)
 
-        if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
-            avg.write_compressed(options.output, j, options.compressbits, nooutliers=True)
-        else:
-            avg.write_image(options.output, j, out_type, False, None, out_mode, not_swap)
+            #CUMMULATIVE AVERAGING
+            #if i == 0:
+            #    avg = d.copy()
+            #else:
+            #    avg += d
+            #avg /= upper_limit  # Final averaging after accumulating all frames
 
-        print(f"Saved averaged frames to {options.output} at index {j}")
+        if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
+            avg.write_compressed( os.path.join(options.path, options.output), j, options.compressbits, nooutliers=True)
+        else:
+            avg.write_image(os.path.join(options.path, options.output), j, out_type, False, None, out_mode, not_swap)
+
+        if options.verbose:
+            print(f"Saved averaged frames to {options.output} at index {j}")
     
     print('\nDONE')
 
