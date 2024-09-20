@@ -41,6 +41,8 @@ def main():
     if options.verbose:
         print(f'there are these many files n={len(files)}\nwhich are files={files}')
 
+    options = makepath(options,'eer_frames_avgs')
+
     for f in files:
         if os.path.splitext(f)[-1].lower() != ".eer":
             print(f"Error: This program only works for EER files. The extension of file={f} is {os.path.splitext(f)[-1]}")
@@ -64,8 +66,6 @@ def main():
         #    out_mode = file_mode_map["float"]  # or another format if needed
         #else:
         #    raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
-
-        options = makepath(options,'sptsim')
 
         # Determine the number of frames to average per final frame
         frames_per_final = n_subframes // options.n_final  # how many input frames per final frame
