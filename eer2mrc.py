@@ -7,8 +7,9 @@ import os
 
 def main():
     parser = argparse.ArgumentParser(description="Average MRC frames and save to a new MRC file.")
+    parser.add_argument("--apix", type=float, default=1.0, help="Default=1.0. Set the sampling size in the output images if 1.0 is not correct.")
     parser.add_argument("--compressbits", type=int, help="HDF only. Bits to keep for compression. -1 for no compression", default=-1)
-    parser.add_argument("--input", help="Input EER file; must end with .eer extension.")
+    parser.add_argument("--input_stem", help="String in input files; note that input EER files must end with .eer extension, so --input_stem=.eer might be good.")
     parser.add_argument("--outmode", type=str, default="float", help="All EMAN2 programs write images with 4-byte floating point values by default. You can specify an alternate format (float, int8, int16, etc.).")
     parser.add_argument("--output", default=None, help="Default=None. Output MRC file")
     parser.add_argument("--path", default='mrc_frames', help="Directory to store converted files. Default=mrc_frames_00")
@@ -39,82 +40,101 @@ def main():
     elif options.eer4x:
         img_type = IMAGE_EER4X
 
-    # Read EER file
-    n_eer = EMUtil.get_image_count(options.input)
-    
-    avg = EMData()
-    
-    out_mode = 'float'
-    out_type = EMUtil.get_image_ext_type("mrc")  # default to mrc
-    not_swap = True  # typically not needed for mrc or hdf
 
-    if options.output is None:
-        options.output = options.input.replace(".eer", "_reduced.mrc")
+    files = [f for f in os.listdir('.') if options.input_stem in f and os.path.splitext(f)[-1].lower() == ".eer"]
+    if options.verbose:
+        print(f'there are these many files n={len(files)}\nwhich are files={files}')
 
-    if options.output.endswith(".mrc"):
-        out_mode = file_mode_map["float"]  # or adjust to int16, int8 if needed
-    elif options.output.endswith(".hdf"):
-        out_type = EMUtil.get_image_ext_type("hdf")
-        out_mode = file_mode_map["float"]  # or another format if needed
-    else:
-        raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
+    for f in files:
 
-    options = makepath(options,'sptsim')
-
-    # Determine the number of frames to average per final frame
-    frames_per_final = n_eer // options.n_final  # how many input frames per final frame
-    remainder_frames = n_eer % options.n_final   # remainder frames to handle at the end
-
-    for j in range(0, options.n_final):
-        if options.verbose:
-            print(f'\nWorking on frame j={j+1}/{options.n_final}')
-
-        # Adjust number of frames in the last iteration if there's a remainder
-        # (For the last frame, average both the regular number of frames and any remaining frames from the division ensuring  all  frames are used).
-        if j == options.n_final - 1:
-            upper_limit = frames_per_final + remainder_frames
-        else:
-            upper_limit = frames_per_final
-
-        if options.verbose:
-            print(f'Averaging {upper_limit} frames for final frame {j+1}')
-
-        for i in range(upper_limit):
-            img_indx = j * frames_per_final + i  # Correctly calculate the frame index
-            d = EMData()
-            d.read_image(options.input, img_indx, False, None, False, img_type)
-            if options.verbose:
-                print(f'Read image i={i+1}/{upper_limit} for final frame {j+1}, img_indx={img_indx}')
-
-            #RUNNING AVERAGE
-            if i == 0:
-                avg = d.copy()
-            else:
-                avg *= i  # Scale by the number of images averaged so far
-                avg += d
-                avg /= (i + 1)
-
-            #CUMMULATIVE AVERAGING
-            #if i == 0:
-            #    avg = d.copy()
-            #else:
-            #    avg += d
-            #avg /= upper_limit  # Final averaging after accumulating all frames
-
+        #Read EER file
+        #n_eer = EMUtil.get_image_count(options.input)
+        n_subframes = EMUtil.get_image_count(f)
+        avg = EMData()
         
-        try:
-            if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
-                avg.write_compressed( os.path.join(options.path, options.output), j, options.compressbits, nooutliers=True)
-            else:
-                avg.write_image(os.path.join(options.path, options.output), j, out_type, False, None, out_mode, not_swap)
-        except Exception as e:
-            print(f"Error encountered while writing frame {j}: {e}")
-            raise
+        out_mode = 'float'
+        out_type = EMUtil.get_image_ext_type("mrc")  # default to mrc
+        not_swap = True  # typically not needed for mrc or hdf
 
-        if options.verbose:
-            print(f"Saved averaged frames to {options.output} at index {j}")
-    
-    print('\nDONE')
+        if options.output is None:
+            options.output = options.input.replace(".eer", "_reduced.mrc")
+
+        if options.output.endswith(".mrc"):
+            out_mode = file_mode_map["float"]  # or adjust to int16, int8 if needed
+        elif options.output.endswith(".hdf"):
+            out_type = EMUtil.get_image_ext_type("hdf")
+            out_mode = file_mode_map["float"]  # or another format if needed
+        else:
+            raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
+
+        options = makepath(options,'sptsim')
+
+        # Determine the number of frames to average per final frame
+        frames_per_final = n_eer // options.n_final  # how many input frames per final frame
+        remainder_frames = n_eer % options.n_final   # remainder frames to handle at the end
+
+
+
+        out3d_img = EMData(d.get_xsize(), d.get_ysize(), options.n_final)
+        if options.apix != 1.0:
+            out3d_img["apix_x"] = options.apix
+            out3d_img["apix_y"] = options.apix
+            out3d_img["apix_z"] = options.apix
+        
+
+        for j in range(0, options.n_final):
+            if options.verbose:
+                print(f'\nWorking on frame j={j+1}/{options.n_final}')
+
+            # Adjust number of frames in the last iteration if there's a remainder
+            # (For the last frame, average both the regular number of frames and any remaining frames from the division ensuring  all  frames are used).
+            if j == options.n_final - 1:
+                upper_limit = frames_per_final + remainder_frames
+            else:
+                upper_limit = frames_per_final
+
+            if options.verbose:
+                print(f'Averaging {upper_limit} frames for final frame {j+1}')
+
+            for i in range(upper_limit):
+                img_indx = j * frames_per_final + i  # Correctly calculate the frame index
+                d = EMData()
+                d.read_image(options.input, img_indx, False, None, False, img_type)
+                if options.verbose:
+                    print(f'Read image i={i+1}/{upper_limit} for final frame {j+1}, img_indx={img_indx}')
+
+                #RUNNING AVERAGE
+                if i == 0:
+                    avg = d.copy()
+                else:
+                    avg *= i  # Scale by the number of images averaged so far
+                    avg += d
+                    avg /= (i + 1)
+
+                #CUMMULATIVE AVERAGING
+                #if i == 0:
+                #    avg = d.copy()
+                #else:
+                #    avg += d
+                #avg /= upper_limit  # Final averaging after accumulating all frames
+
+            
+            try:
+                if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
+                    avg.write_compressed( os.path.join(options.path, options.output), j, options.compressbits, nooutliers=True)
+                else:
+                    #avg.write_image(os.path.join(options.path, options.output), j, out_type, False, None, out_mode, not_swap)
+                    region = Region(0, 0, j, d.get_xsize(), d.get_ysize(), 1)
+                    avg.write_image(os.path.join(options.path, options.output), 0, out_type, False, region, out_mode, not_swap)
+                    
+            except Exception as e:
+                print(f"Error encountered while writing frame {j}: {e}")
+                raise
+
+            if options.verbose:
+                print(f"Saved averaged frames to {options.output} at index {j}")
+        
+        print('\nDONE')
 
 if __name__ == "__main__":
     main()
