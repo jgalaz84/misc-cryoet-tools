@@ -46,7 +46,7 @@ def main():
             print(f"Error: This program only works for EER files. The extension of file={f} is {os.path.splitext(f)[-1]}")
             sys.exit(1)
 
-        out_img_file = f.replace(".eer", "_reduced.mrc")
+        out_img_file = os.path.join(options.path, f.replace(".eer", "_reduced.mrc"))
 
         #Read EER file
         #n_eer = EMUtil.get_image_count(options.input)
@@ -132,9 +132,9 @@ def main():
                 print(f"Error encountered while writing frame {j}: {e}")
                 raise
 
-        out3d_img.write_image(os.path.join(options.path, out_img_file), 0, out_type, False, None, out_mode, not_swap)
+        out3d_img.write_image(out_img_file, 0)
         if options.verbose:
-            print(f"Saved averaged frames to {os.path.join(options.path, out_img_file)}")
+            print(f"Saved averaged frames to {out_img_file}")
         
         print('\nDONE')
 
