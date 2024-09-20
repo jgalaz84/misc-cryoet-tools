@@ -134,7 +134,7 @@ def main():
 
         out3d_img.write_image(os.path.join(options.path, out_img_file), 0, out_type, False, None, out_mode, not_swap)
         if options.verbose:
-            print(f"Saved averaged frames to {out_img_file}")
+            print(f"Saved averaged frames to {os.path.join(options.path, out_img_file)}")
         
         print('\nDONE')
 
