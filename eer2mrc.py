@@ -42,7 +42,7 @@ def main():
         print(f'there are these many files n={len(files)}\nwhich are files={files}')
 
     for f in files:
-        if os.path.splitext(f).lower() != ".eer":
+        if os.path.splitext(f)[-1].lower() != ".eer":
             print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
             sys.exit(1)
 
