@@ -68,8 +68,8 @@ def main():
         options = makepath(options,'sptsim')
 
         # Determine the number of frames to average per final frame
-        frames_per_final = n_eer // options.n_final  # how many input frames per final frame
-        remainder_frames = n_eer % options.n_final   # remainder frames to handle at the end
+        frames_per_final = n_subframes // options.n_final  # how many input frames per final frame
+        remainder_frames = n_subframes % options.n_final   # remainder frames to handle at the end
 
 
 
