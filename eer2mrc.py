@@ -4,6 +4,140 @@ import argparse
 from EMAN2 import *
 from EMAN2_utils import *
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+print_lock = threading.Lock()
+
+def process_file(f, options, img_type):
+    start_time = time.time()
+    out_img_file = os.path.join(options.path, f.replace(".eer", "_reduced.mrc"))
+    n_subframes = EMUtil.get_image_count(f)
+    avg = EMData()
+
+    out_mode = 'float'
+    out_type = EMUtil.get_image_ext_type("mrc")  # default to mrc
+    not_swap = True  # typically not needed for mrc or hdf
+
+    frames_per_final = n_subframes // options.n_final
+    remainder_frames = n_subframes % options.n_final
+
+    hdr = EMData(f, 0, True)
+    nx = hdr['nx']
+    ny = hdr['ny']
+    out3d_img = EMData(nx, ny, options.n_final)
+    
+    if options.apix != 1.0:
+        out3d_img["apix_x"] = options.apix
+        out3d_img["apix_y"] = options.apix
+        out3d_img["apix_z"] = options.apix
+
+    for j in range(0, options.n_final):
+        with print_lock:
+            print(f'[{time.strftime("%H:%M:%S")}] Processing frame {j+1}/{options.n_final} for file {f}')
+
+        if j == options.n_final - 1:
+            upper_limit = frames_per_final + remainder_frames
+        else:
+            upper_limit = frames_per_final
+
+        for i in range(upper_limit):
+            img_indx = j * frames_per_final + i
+            d = EMData()
+            d.read_image(f, img_indx, False, None, False, img_type)
+
+            if options.verbose and i % 100 == 0:  # Reducing print frequency
+                with print_lock:
+                    print(f'[{time.strftime("%H:%M:%S")}] File: {f}, Frame {i+1}/{upper_limit}, img_indx={img_indx}')
+
+            # Running average
+            if i == 0:
+                avg = d.copy()
+            else:
+                avg *= i
+                avg += d
+                avg /= (i + 1)
+
+        out3d_img.insert_clip(avg, (0, 0, j))
+
+        with print_lock:
+            print(f"[{time.strftime('%H:%M:%S')}] Inserted avg frame {j} into output image for file {f}")
+
+    out3d_img.write_image(out_img_file, 0)
+    duration = time.time() - start_time
+
+    with print_lock:
+        print(f"[{time.strftime('%H:%M:%S')}] Saved averaged frames to {out_img_file}. Time taken: {duration:.2f} seconds for file {f}")
+
+    return f
+
+def main():
+    parser = argparse.ArgumentParser(description="Average MRC frames and save to a new MRC file.")
+    parser.add_argument("--apix", type=float, default=1.0, help="Set the sampling size in the output images if 1.0 is not correct.")
+    parser.add_argument("--input_stem", help="String in input files; note that input EER files must end with .eer extension, so --input_stem=.eer might be good.")
+    parser.add_argument("--outmode", type=str, default="float", help="Specify an alternate format (float, int8, int16, etc.).")
+    parser.add_argument("--path", default='mrc_frames', help="Directory to store converted files. Default=mrc_frames_00")
+    parser.add_argument("--n_final", type=int, default=10, help="Number of frames to have in the new mrc or hdf stack.")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--threads", type=int, default=4, help="Number of threads to use for parallel processing.")
+
+    eer_input_group = parser.add_mutually_exclusive_group()
+    eer_input_group.add_argument("--eer2x", action="store_true", help="Render EER file on 8k grid.")
+    eer_input_group.add_argument("--eer4x", action="store_true", help="Render EER file on 16k grid.")
+
+    options = parser.parse_args()
+
+    if options.n_final <= 0:
+        print("Error: --n_final must be greater than 0.")
+        sys.exit(1)
+
+    img_type = IMAGE_UNKNOWN
+    if options.eer2x:
+        img_type = IMAGE_EER2X
+    elif options.eer4x:
+        img_type = IMAGE_EER4X
+
+    files = [f for f in os.listdir('.') if options.input_stem in f and os.path.splitext(f)[-1].lower() == ".eer"]
+    
+    with print_lock:
+        print(f'There are {len(files)} files to process: {files}')
+
+    options = makepath(options, 'eer_frames_avgs')
+
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=options.threads) as executor:
+        futures = [executor.submit(process_file, f, options, img_type) for f in files]
+        for future in futures:
+            try:
+                result = future.result()
+                with print_lock:
+                    print(f'Processing completed for file: {result}')
+            except Exception as e:
+                with print_lock:
+                    print(f'Error occurred: {e}')
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+import numpy as np
+import mrcfile
+import argparse
+from EMAN2 import *
+from EMAN2_utils import *
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def process_file(f, options, img_type):
@@ -115,6 +249,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
+
+
+
+
+
+
+
+
+
 
 
 
