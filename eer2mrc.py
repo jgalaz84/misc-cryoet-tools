@@ -123,15 +123,17 @@ def main():
                 #    avg.write_compressed( os.path.join(options.path, out_img_file), j, options.compressbits, nooutliers=True)
                 #else:
                     #avg.write_image(os.path.join(options.path, out_img_file), j, out_type, False, None, out_mode, not_swap)
-                region = Region(0, 0, j, nx, ny, 1)
-                avg.write_image(os.path.join(options.path, out_img_file), 0, out_type, False, region, out_mode, not_swap)
+                #region = Region(0, 0, j, nx, ny, 1)
+                #avg.write_image(os.path.join(options.path, out_img_file), 0, out_type, False, region, out_mode, not_swap)
+                out3d_img.insert_clip(avg, (0, 0, j))
+                print(f"Inserted avg frame {j} into output image")
                     
             except Exception as e:
                 print(f"Error encountered while writing frame {j}: {e}")
                 raise
 
-            if options.verbose:
-                print(f"Saved averaged frames to {oout_img_file} at slice {j}")
+        if options.verbose:
+            print(f"Saved averaged frames to {out_img_file}")
         
         print('\nDONE')
 
