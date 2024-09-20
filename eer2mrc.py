@@ -8,10 +8,10 @@ import os
 def main():
     parser = argparse.ArgumentParser(description="Average MRC frames and save to a new MRC file.")
     parser.add_argument("--apix", type=float, default=1.0, help="Default=1.0. Set the sampling size in the output images if 1.0 is not correct.")
-    parser.add_argument("--compressbits", type=int, help="HDF only. Bits to keep for compression. -1 for no compression", default=-1)
+    #parser.add_argument("--compressbits", type=int, help="HDF only. Bits to keep for compression. -1 for no compression", default=-1)
     parser.add_argument("--input_stem", help="String in input files; note that input EER files must end with .eer extension, so --input_stem=.eer might be good.")
     parser.add_argument("--outmode", type=str, default="float", help="All EMAN2 programs write images with 4-byte floating point values by default. You can specify an alternate format (float, int8, int16, etc.).")
-    parser.add_argument("--output", default=None, help="Default=None. Output MRC file")
+    #parser.add_argument("--output", default=None, help="Default=None. Output MRC file")
     parser.add_argument("--path", default='mrc_frames', help="Directory to store converted files. Default=mrc_frames_00")
     parser.add_argument("--n_final", type=int, default=10, help="Number of frames to have in the new mrc or hdf stack; e.g., if EER frames are 100, and --n_final is 10, then each 10 EER frames will be averaged together. Remainder frames will be averaged into the last new frame.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
@@ -22,9 +22,9 @@ def main():
 
     options = parser.parse_args()
 
-    if options.compressbits >= 0 and not options.output.endswith(".hdf"):
-        print(f'\nERROR: --compressbits requires .hdf output. Current file has extension={os.path.splitext(options.output)[-1]}')
-        sys.exit(1)
+    #if options.compressbits >= 0 and not options.output.endswith(".hdf"):
+    #    print(f'\nERROR: --compressbits requires .hdf output. Current file has extension={os.path.splitext(options.output)[-1]}')
+    #    sys.exit(1)
 
     if options.n_final <= 0:
         print("Error: --n_final must be greater than 0.")
@@ -43,8 +43,10 @@ def main():
 
     for f in files:
         if os.path.splitext(f)[-1].lower() != ".eer":
-            print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
+            print(f"Error: This program only works for EER files. The extension of file={f} is {os.path.splitext(f)[-1]}")
             sys.exit(1)
+
+        out_img_file = f.replace(".eer", "_reduced.mrc")
 
         #Read EER file
         #n_eer = EMUtil.get_image_count(options.input)
@@ -55,16 +57,13 @@ def main():
         out_type = EMUtil.get_image_ext_type("mrc")  # default to mrc
         not_swap = True  # typically not needed for mrc or hdf
 
-        if options.output is None:
-            options.output = options.input.replace(".eer", "_reduced.mrc")
-
-        if options.output.endswith(".mrc"):
-            out_mode = file_mode_map["float"]  # or adjust to int16, int8 if needed
-        elif options.output.endswith(".hdf"):
-            out_type = EMUtil.get_image_ext_type("hdf")
-            out_mode = file_mode_map["float"]  # or another format if needed
-        else:
-            raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
+        #if options.output.endswith(".mrc"):
+        #    out_mode = file_mode_map["float"]  # or adjust to int16, int8 if needed
+        #elif options.output.endswith(".hdf"):
+        #    out_type = EMUtil.get_image_ext_type("hdf")
+        #    out_mode = file_mode_map["float"]  # or another format if needed
+        #else:
+        #    raise ValueError("Unsupported output format. Only .mrc and .hdf are supported.")
 
         options = makepath(options,'sptsim')
 
@@ -98,7 +97,7 @@ def main():
             for i in range(upper_limit):
                 img_indx = j * frames_per_final + i  # Correctly calculate the frame index
                 d = EMData()
-                d.read_image(options.input, img_indx, False, None, False, img_type)
+                d.read_image(f, img_indx, False, None, False, img_type)
                 if options.verbose:
                     print(f'Read image i={i+1}/{upper_limit} for final frame {j+1}, img_indx={img_indx}')
 
@@ -119,19 +118,19 @@ def main():
 
             
             try:
-                if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
-                    avg.write_compressed( os.path.join(options.path, options.output), j, options.compressbits, nooutliers=True)
-                else:
-                    #avg.write_image(os.path.join(options.path, options.output), j, out_type, False, None, out_mode, not_swap)
-                    region = Region(0, 0, j, d.get_xsize(), d.get_ysize(), 1)
-                    avg.write_image(os.path.join(options.path, options.output), 0, out_type, False, region, out_mode, not_swap)
+                #if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
+                #    avg.write_compressed( os.path.join(options.path, out_img_file), j, options.compressbits, nooutliers=True)
+                #else:
+                    #avg.write_image(os.path.join(options.path, out_img_file), j, out_type, False, None, out_mode, not_swap)
+                region = Region(0, 0, j, d.get_xsize(), d.get_ysize(), 1)
+                avg.write_image(os.path.join(options.path, out_img_file), 0, out_type, False, region, out_mode, not_swap)
                     
             except Exception as e:
                 print(f"Error encountered while writing frame {j}: {e}")
                 raise
 
             if options.verbose:
-                print(f"Saved averaged frames to {options.output} at index {j}")
+                print(f"Saved averaged frames to {oout_img_file} at slice {j}")
         
         print('\nDONE')
 
