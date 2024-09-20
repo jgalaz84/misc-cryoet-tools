@@ -101,10 +101,15 @@ def main():
             #    avg += d
             #avg /= upper_limit  # Final averaging after accumulating all frames
 
-        if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
-            avg.write_compressed( os.path.join(options.path, options.output), j, options.compressbits, nooutliers=True)
-        else:
-            avg.write_image(os.path.join(options.path, options.output), j, out_type, False, None, out_mode, not_swap)
+        
+        try:
+            if options.compressbits >= 0 and out_type == EMUtil.get_image_ext_type("hdf"):
+                avg.write_compressed( os.path.join(options.path, options.output), j, options.compressbits, nooutliers=True)
+            else:
+                avg.write_image(os.path.join(options.path, options.output), j, out_type, False, None, out_mode, not_swap)
+        except Exception as e:
+            print(f"Error encountered while writing frame {j}: {e}")
+            raise
 
         if options.verbose:
             print(f"Saved averaged frames to {options.output} at index {j}")
