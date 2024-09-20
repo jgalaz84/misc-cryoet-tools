@@ -132,7 +132,7 @@ def main():
                 print(f"Error encountered while inserting frame {j}: {e}")
                 raise
 
-        print(f'inserted all frames; attempting to write output_type={type(out3d_img)} to file={out_img_file} with min={out3d_img['minimum']},max{out3d_img['maximum']},sigma={out3d_img['sigma']}')
+        print(f'inserted all frames; attempting to write output_type={type(out3d_img)} to file={out_img_file} with min={out3d_img["minimum"]},max{out3d_img["maximum"]},sigma={out3d_img["sigma"]}')
         out3d_img.write_image(out_img_file, 0)
         if options.verbose:
             print(f"Saved averaged frames to {out_img_file}")
