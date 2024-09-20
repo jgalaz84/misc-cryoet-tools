@@ -71,9 +71,10 @@ def main():
         frames_per_final = n_subframes // options.n_final  # how many input frames per final frame
         remainder_frames = n_subframes % options.n_final   # remainder frames to handle at the end
 
-
-
-        out3d_img = EMData(d.get_xsize(), d.get_ysize(), options.n_final)
+        hdr = EMData(f,0,True)
+        nx = hdr['nx']
+        ny = hdr['ny']
+        out3d_img = EMData( nx, ny, options.n_final)
         if options.apix != 1.0:
             out3d_img["apix_x"] = options.apix
             out3d_img["apix_y"] = options.apix
@@ -122,7 +123,7 @@ def main():
                 #    avg.write_compressed( os.path.join(options.path, out_img_file), j, options.compressbits, nooutliers=True)
                 #else:
                     #avg.write_image(os.path.join(options.path, out_img_file), j, out_type, False, None, out_mode, not_swap)
-                region = Region(0, 0, j, d.get_xsize(), d.get_ysize(), 1)
+                region = Region(0, 0, j, nx, ny, 1)
                 avg.write_image(os.path.join(options.path, out_img_file), 0, out_type, False, region, out_mode, not_swap)
                     
             except Exception as e:
