@@ -22,10 +22,6 @@ def main():
 
     options = parser.parse_args()
 
-    if os.path.splitext(options.input)[-1].lower() != ".eer":
-        print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
-        sys.exit(1)
-
     if options.compressbits >= 0 and not options.output.endswith(".hdf"):
         print(f'\nERROR: --compressbits requires .hdf output. Current file has extension={os.path.splitext(options.output)[-1]}')
         sys.exit(1)
@@ -46,6 +42,9 @@ def main():
         print(f'there are these many files n={len(files)}\nwhich are files={files}')
 
     for f in files:
+        if os.path.splitext(f).lower() != ".eer":
+            print(f"Error: This program only works for EER files. The extension of --input is {os.path.splitext(options.input)[-1]}")
+            sys.exit(1)
 
         #Read EER file
         #n_eer = EMUtil.get_image_count(options.input)
