@@ -84,9 +84,15 @@ def main():
 							bad_dir = options.targetdir +'/z.bad'
 						os.mkdir(bad_dir)
 					os.rename(t,bad_dir+'/'+t)
-					try:
-						os.rename(t.replace(file_ext,'.rawtlt'),bad_dir+'/'+t.replace(file_ext,'.rawtlt'))
+					
 					print("\nWARNING: moved file f={} to {} because {}/{}={} was lower than {}".format(t,bad_dir,nz,options.n_expected,round(float(nz)/float(options.n_expected),4),options.threshold_to_exclude))
+
+					try:
+						rawtilt_file = t.replace(file_ext,'.rawtlt')
+						os.rename(rawtilt_file,bad_dir+'/'+ rawtilt_file)
+						print(f"\nremoved matching rawtlt file {rawtilt_file}")
+					except:
+						pass
 
 			else:
 				print("\nERROR: --threshold_to_exclude requires --n_expected. EXITING")
