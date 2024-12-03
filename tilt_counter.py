@@ -86,12 +86,13 @@ def main():
 					os.rename(t,bad_dir+'/'+t)
 					
 					print("\nWARNING: moved file f={} to {} because {}/{}={} was lower than {}".format(t,bad_dir,nz,options.n_expected,round(float(nz)/float(options.n_expected),4),options.threshold_to_exclude))
-
+					rawtlt_file = t.replace(file_ext,'.rawtlt')
+					print(f"\nI will look for matching rawtlt file={rawtlt_file}")
 					try:
-						rawtilt_file = t.replace(file_ext,'.rawtlt')
-						os.rename(rawtilt_file,bad_dir+'/'+ rawtilt_file)
-						print(f"\nremoved matching rawtlt file {rawtilt_file}")
+						os.rename(rawtlt_file,bad_dir+'/'+ rawtlt_file)
+						print(f"\nremoved matching rawtlt file {rawtlt_file}")
 					except:
+						print(f"\nIs {rawtlt_file} among fsindir?: {rawtlt_file in fsindir}")
 						pass
 
 			else:
