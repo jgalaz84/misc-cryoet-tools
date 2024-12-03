@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Author: Jesus G. Galaz-Montoya, 06/05/2012 - Modified 14/Feb/2022
+# Author: Jesus G. Galaz-Montoya, 06/05/2012 - Modified 02/Dec/2024
 
 import os
 import random
@@ -68,6 +68,8 @@ def main():
 		
 		hdr = EMData(t,0,True)
 		nz = hdr['nz']
+
+		filename, file_ext = os.path.splitext(t)
 		
 		line = ID + '\t' + str(nz) + '\n'
 		lines.append(line)
@@ -82,6 +84,8 @@ def main():
 							bad_dir = options.targetdir +'/z.bad'
 						os.mkdir(bad_dir)
 					os.rename(t,bad_dir+'/'+t)
+					try:
+						os.rename(t.replace(file_ext,'.rawtlt'),bad_dir+'/'+t.replace(file_ext,'.rawtlt'))
 					print("\nWARNING: moved file f={} to {} because {}/{}={} was lower than {}".format(t,bad_dir,nz,options.n_expected,round(float(nz)/float(options.n_expected),4),options.threshold_to_exclude))
 
 			else:
