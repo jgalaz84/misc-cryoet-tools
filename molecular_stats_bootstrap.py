@@ -226,7 +226,7 @@ def visualize_results(results, output_dir, metric_keys, effect_size_types):
     should_plot_large = False
 
     # Threshold definitions
-    thresholds = {'small': 0.2, 'medium': 0.5, 'large': 0.8}
+    thresholds = {'small': 0.1, 'medium': 0.3, 'large': 0.5}
     line_styles = {'small': (3, 3), 'medium': (5, 5), 'large': (10, 2)}
 
     # Plot effect sizes and track thresholds
