@@ -109,6 +109,7 @@ def create_output_directory(base_dir):
     os.makedirs(output_dir)
     return output_dir
 
+'''
 def calculate_metrics_for_images(image_3d):
     print("\nCalculating metrics for loaded image data...")  # Print statement for clarity
     metrics = {
@@ -119,11 +120,26 @@ def calculate_metrics_for_images(image_3d):
     # Process the slices
     extreme_slices = process_slices(image_3d, metrics)
     return metrics, extreme_slices
+    '''
+
+def calculate_metrics_for_images(image_3d, iteration, volume_idx):
+    print("\nCalculating metrics for loaded image data...")  # Clarify start
+    metrics = {
+        'kurtosis': [], 'entropy': [], 'contrast': [],
+        'homogeneity': [], 'energy': [], 'correlation': [],
+        'mean': [], 'std_dev': []
+    }
+    
+    # Process slices and get extremes
+    extremes = process_slices(image_3d, metrics, iteration, volume_idx)
+    return metrics, extremes
 
 
+
+'''
 def process_slices(image_3d, metrics):
     """Process all slices from a 3D volume and calculate statistical metrics."""
-    print(f'\nAnalyzing slices...')
+   # print(f'\nAnalyzing slices...')
     
     extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
     
@@ -169,6 +185,57 @@ def process_slices(image_3d, metrics):
     
     print()  # Move to the next line after processing all slices
     return extremes
+    '''
+
+def process_slices(image_3d, metrics, iteration, volume_idx):
+    """Process slices and calculate metrics with dynamic progress updates."""
+    num_slices = image_3d.shape[0]
+    extremes = {key: {'min': float('inf'), 'max': float('-inf')} for key in metrics}  # Track extremes
+
+    for idx in range(num_slices):
+        slice_2d = image_3d[idx, :, :]
+        mean = np.mean(slice_2d)
+        sigma = np.std(slice_2d)
+        
+        # Update the dynamic progress message
+        sys.stdout.write(
+            f"\rProcessing slice {idx+1}/{num_slices} | Volume {volume_idx+1} | Iteration {iteration+1}"
+        )
+        sys.stdout.flush()
+        
+        if sigma > 0:
+            # Normalize the slice if it's float-based
+            slice_normalized = (slice_2d * 255).astype(np.uint8) if slice_2d.dtype in [np.float32, np.float64] else slice_2d
+            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
+            
+            # Calculate Haralick features and other metrics
+            feature_values = {
+                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
+                'entropy': shannon_entropy(slice_normalized),
+                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
+                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
+                'energy': graycoprops(glcm, 'energy')[0].mean(),
+                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
+                'mean': mean,
+                'std_dev': sigma
+            }
+            
+            # Update metrics and track extremes
+            for key, value in feature_values.items():
+                metrics[key].append(value)
+                if value < extremes[key]['min']:
+                    extremes[key]['min'] = value
+                if value > extremes[key]['max']:
+                    extremes[key]['max'] = value
+
+    # Clear the dynamic line after processing
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.flush()
+    print(f"Completed Volume {volume_idx+1} in Iteration {iteration+1}.")
+
+    return extremes
+
+
 
 
 def is_normal(data, alpha=0.05):
@@ -191,6 +258,235 @@ def calculate_rank_biserial(data1, data2):
     return rank_biserial
 
 
+
+
+def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, metric_keys, filename, data_labels=None):
+    print("\nCreating violin plots for", filename)
+
+    valid_metrics = []
+    p_values = []
+    significance_labels = []
+    cohens_d_values = []
+    rank_biserial_values = []
+
+    # Set default data labels if none provided
+    if data_labels is None:
+        data_labels = ['Dataset 1', 'Dataset 2']
+    else:
+        data_labels = data_labels.split(',')
+
+    # Determine valid metrics and calculate stats (mean, median, stderr)
+    stats_summary1 = {}
+    stats_summary2 = {}
+    
+    for key in metric_keys:
+        data1, data2 = np.array(metrics1[key]), np.array(metrics2[key])
+
+        # Skip if data contains NaN values
+        if np.isnan(data1).all() or np.isnan(data2).all():
+            print(f"Skipping {key} due to invalid data")
+            continue
+
+        # Check normality and select the appropriate test
+        normal1 = is_normal(data1)
+        normal2 = is_normal(data2)
+
+        if normal1 and normal2:
+            stat, p_value = ttest_ind(data1, data2)
+            cohen_d = calculate_cohens_d(data1, data2)  # Cohen's d calculation for t-test
+            rank_biserial = None  # Not applicable for t-test
+        else:
+            stat, p_value = mannwhitneyu(data1, data2)
+            rank_biserial = calculate_rank_biserial(data1, data2)  # Rank-biserial for Mann-Whitney U
+            cohen_d = None  # Not applicable for Mann-Whitney U
+
+        # Skip if p-value is NaN
+        if np.isnan(p_value):
+            print(f"Skipping {key} due to NaN p-value")
+            continue
+
+        valid_metrics.append(key)
+        p_values.append(p_value)
+
+        # Determine significance label
+        if p_value < 0.001:
+            significance_labels.append("***")
+        elif p_value < 0.01:
+            significance_labels.append("**")
+        elif p_value < 0.05:
+            significance_labels.append("*")
+        else:
+            significance_labels.append("ns")
+
+        # Calculate mean, median, and standard error for dataset1 and dataset2
+        mean1, median1, stderr1 = np.mean(data1), np.median(data1), np.std(data1) / np.sqrt(len(data1))
+        mean2, median2, stderr2 = np.mean(data2), np.median(data2), np.std(data2) / np.sqrt(len(data2))
+        
+        stats_summary1[key] = (mean1, median1, stderr1)
+        stats_summary2[key] = (mean2, median2, stderr2)
+
+        # Storing Cohen's d or rank-biserial values
+        cohens_d_values.append(cohen_d)
+        rank_biserial_values.append(rank_biserial)
+
+    num_metrics = len(valid_metrics)
+
+    # If no valid metrics, print a warning and exit the function
+    if num_metrics == 0:
+        print("No valid metrics to plot.")
+        return
+
+    fig, axes = plt.subplots(1, num_metrics, figsize=(4 * num_metrics, 8))  # Increase height for better layout
+
+    color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Color palette for distinction
+
+    # Plot valid metrics
+    for i, key in enumerate(valid_metrics):
+        ax = axes[i] if num_metrics > 1 else axes  # Handle case of single subplot
+        data1, data2 = np.array(metrics1[key]), np.array(metrics2[key])
+
+        # Adjusting y-limits to start from 0 or the minimum value PLUS PADDING
+        min_val1 = np.min(data1)
+        max_val1 = np.max(data1)
+        min_val2 = np.min(data2)
+        max_val2 = np.max(data2)
+
+        global_min = min(min_val1, min_val2)
+        global_max = max(max_val1, max_val2)
+
+        datarange = global_max - global_min
+        global_min_padded = global_min - datarange * 0.1
+        global_max_padded = global_max + datarange * 0.1
+        ax.set_ylim(global_min_padded, global_max_padded)
+
+        # Plot violin plot for Dataset 1
+        parts1 = ax.violinplot(data1, positions=[1], showmeans=False, showmedians=False, showextrema=False)
+        for pc in parts1['bodies']:
+            pc.set_facecolor(color_palette[i % len(color_palette)])
+            pc.set_alpha(0.3)  # Set transparency for violin plot overlay
+            pc.set_edgecolor('black')
+
+        # Overlay scatter plot of data points for Dataset 1
+        ax.scatter(np.full_like(data1, 1), data1, color=color_palette[i % len(color_palette)], alpha=0.7, edgecolor='k')
+
+        # Custom additions for quartiles, medians, and extrema for Dataset 1
+        quartile1, med1, quartile3 = np.percentile(data1, [25, 50, 75])
+        mean1 = np.mean(data1)
+
+        ax.scatter(1, med1, color='red', zorder=3)  # Median (Red)
+        ax.scatter(1, mean1, color='white', zorder=3)  # Mean (White)
+        ax.vlines(1, min_val1, max_val1, color='black', linestyle='-', lw=2)  # Min-Max range (Black)
+        ax.vlines(1, quartile1, quartile3, color='black', linestyle='-', lw=5)  # Interquartile range (Black)
+
+        # Label the distribution as Gaussian or Non-Gaussian for Dataset 1
+        label1 = 'Gaussian' if normal1 else 'Non-Gaussian'
+        ax.text(1, global_max_padded, label1, ha='center', va='bottom', fontsize=10, color='black')
+
+        # Plot violin plot for Dataset 2
+        parts2 = ax.violinplot(data2, positions=[2], showmeans=False, showmedians=False, showextrema=False)
+        for pc in parts2['bodies']:
+            pc.set_facecolor(color_palette[i % len(color_palette)])
+            pc.set_alpha(0.3)  # Set transparency for violin plot overlay
+            pc.set_edgecolor('black')
+
+        # Overlay scatter plot of data points for Dataset 2
+        ax.scatter(np.full_like(data2, 2), data2, color=color_palette[i % len(color_palette)], alpha=0.7, edgecolor='k')
+
+        # Custom additions for quartiles, medians, and extrema for Dataset 2
+        quartile1, med2, quartile3 = np.percentile(data2, [25, 50, 75])
+        mean2 = np.mean(data2)
+
+        ax.scatter(2, med2, color='red', zorder=3)  # Median (Red)
+        ax.scatter(2, mean2, color='white', zorder=3)  # Mean (White)
+        ax.vlines(2, min_val2, max_val2, color='black', linestyle='-', lw=2)  # Min-Max range (Black)
+        ax.vlines(2, quartile1, quartile3, color='black', linestyle='-', lw=5)  # Interquartile range (Black)
+
+        # Label the distribution as Gaussian or Non-Gaussian for Dataset 2
+        label2 = 'Gaussian' if normal2 else 'Non-Gaussian'
+        ax.text(2, global_max_padded, label2, ha='center', va='bottom', fontsize=10, color='black')
+
+        # Display numerical p-value, Cohen's d or Rank-biserial correlation, mean, and median
+        N1, N2 = len(data1), len(data2)
+        
+        # For non-parametric Mann-Whitney U test, display Rank-biserial correlation
+        if rank_biserial_values[i] is not None:
+            rank_biserial_display = f'RBC={rank_biserial_values[i]:.6f}'
+            cohens_d_display = ''
+        # For parametric t-test, display Cohen's d
+        elif cohens_d_values[i] is not None:
+            cohens_d_display = f"Cohen's d={cohens_d_values[i]:.6f}"
+            rank_biserial_display = ''
+        else:
+            rank_biserial_display = ''
+            cohens_d_display = ''
+
+        # Adding these statistics under p-value and significance level in the plot titles
+        ax.set_title(
+            f'{key} (p={p_values[i]:.6f}, {significance_labels[i]})\n'
+            f'N={N1}, N={N2}\nMean1={mean1:.6f}, Median1={med1:.6f}\n'
+            f'Mean2={mean2:.6f}, Median2={med2:.6f}\n'
+            f'{cohens_d_display} {rank_biserial_display}', fontsize=10, pad=30
+        )
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(data_labels)
+
+        # Display the extreme slices corresponding to min and max values
+        # Place the min and max slices below the plot for Dataset 1
+        ax_min1 = fig.add_axes([0.05 + i * (1 / num_metrics), -0.15, 0.1, 0.1])
+        ax_min1.imshow(extreme_slices1[key]['min_slice'], cmap='gray')
+        ax_min1.axis('off')
+        ax_min1.set_title(f'Min {key}', fontsize=8)
+
+        ax_max1 = fig.add_axes([0.05 + i * (1 / num_metrics), -0.3, 0.1, 0.1])
+        ax_max1.imshow(extreme_slices1[key]['max_slice'], cmap='gray')
+        ax_max1.axis('off')
+        ax_max1.set_title(f'Max {key}', fontsize=8)
+
+        # Place the min and max slices below the plot for Dataset 2
+        ax_min2 = fig.add_axes([0.25 + i * (1 / num_metrics), -0.15, 0.1, 0.1])
+        ax_min2.imshow(extreme_slices2[key]['min_slice'], cmap='gray')
+        ax_min2.axis('off')
+        ax_min2.set_title(f'Min {key}', fontsize=8)
+
+        ax_max2 = fig.add_axes([0.25 + i * (1 / num_metrics), -0.3, 0.1, 0.1])
+        ax_max2.imshow(extreme_slices2[key]['max_slice'], cmap='gray')
+        ax_max2.axis('off')
+        ax_max2.set_title(f'Max {key}', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig)
+    print(f"Saved {filename} successfully.")
+
+    # Save mean, median, standard error, Cohen's d or Rank-biserial correlation to text files
+    for label, stats_summary, d_values, rbc_values in zip(
+        data_labels, [stats_summary1, stats_summary2], cohens_d_values, rank_biserial_values):
+        
+        with open(os.path.join(output_dir, f"{label}_avg_stats.txt"), 'w') as f:
+            f.write(f"Metric\tMean\tMedian\tStandard Error\tEffect Size\n")
+            for key in stats_summary:
+                mean, median, stderr = stats_summary[key]
+                
+                # Display either Cohen's d or Rank-biserial correlation
+                if rbc_values is not None:
+                    effect_size = f'Rank-biserial={rbc_values:.6f}'
+                elif d_values is not None:
+                    effect_size = f"Cohen's d={d_values:.6f}"
+                else:
+                    effect_size = 'N/A'
+                
+                f.write(f"{key}\t{mean:.6f}\t{median:.6f}\t{stderr:.6f}\t{effect_size}\n")
+
+    # Save p-values to a text file with 6 significant decimals
+    with open(os.path.join(output_dir, filename.replace('.png', '_pvalues.txt')), 'w') as f:
+        for key, p_value, label in zip(valid_metrics, p_values, significance_labels):
+            f.write(f'{key}: p={p_value:.6f}, {label}\n')
+
+
+
+
+'''
+WORKS
 def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, metric_keys, filename, data_labels=None):
     print("\nCreating violin plots for", filename)
 
@@ -390,7 +686,7 @@ def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices
         for key, p_value, label in zip(valid_metrics, p_values, significance_labels):
             f.write(f'{key}: p={p_value:.6f}, {label}\n')
 
-
+'''
 
 
 '''
