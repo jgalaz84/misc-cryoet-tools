@@ -240,8 +240,8 @@ def main():
 				#cmd += " && cp tomostacker_01/stack.rawtlt ../tiltseries_compiled/stack_" + str(num) + ".rawtlt"
 			
 
-			if options.tiltstacker_path:
-				cmd += " && python3 " + options.tiltstacker_path + " --input .mrc --tag " + tag
+			if options.tilt_stacker_path:
+				cmd += " && python3 " + options.tilt_stacker_path + " --input .mrc --tag " + tag
 			else:
 				cmd += " && e2tomo_tiltstacker.py --input .mrc --tag " + tag
 			if options.anglesindxinfilename:
