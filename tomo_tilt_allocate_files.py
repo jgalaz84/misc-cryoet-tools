@@ -64,7 +64,7 @@ def main():
 	
 	parser.add_argument("--tag",type=str,default=None,help=""""Default=None. String to append to the beginning of the tiltseries output filename. The default is filename is '<stem>_stack.st' where <stem> is whatever you feed to --stem; if tag=xxx, the output will be '<stem>_xxx_stack.st' """)	
 	
-	parser.add_argument("--tiltstacker_path",type=str,default=None,help=""""Default=None. Path to e2tomo_tilstacker.py version to use if you don't want to use the one from the EMAN2 installation.""")	
+	parser.add_argument("--tilt_stacker_path",type=str,default=None,help=""""Default=None. Path tomo_tilt_stacker.py version to use if you don't want to use the one from the EMAN2 installation.""")	
 
 	parser.add_argument("--verbose", "-v", type=int, default=0, help="Default 0. Verbose level [0-9], higner number means higher level of verboseness",dest="verbose", action="store", metavar="n")
 
