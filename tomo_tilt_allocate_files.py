@@ -179,7 +179,7 @@ def main():
 			
 			#tag = stem + intag + str(num)
 
-			tag = stem + directories_dict[d]
+			tag = stem + ''.join(s for s in directories_dict[d] if not s.isalpha())
 			#if "_" not in tag[-1:]:
 			#	tag+="_"
 			print("\ntherefore final tag={}".format(tag))
@@ -188,7 +188,7 @@ def main():
 			#if options.tag:
 			outfile = tag.rstrip('_') + ".st"
 			
-			print("\noutfile={}".format(outfile))
+			print("\n\n\n\n!!!!!!!!!outfile={}".format(outfile))
 			#sys.exit(1)
 
 			for f in findird:
@@ -209,6 +209,7 @@ def main():
 				cmd+=cmdapix
 				print("\nfixing apix for frames in dir={}\ncmdapix is {}".format(d,cmdapix))
 			
+			'''
 			if options.motioncorr:	
 				#try:
 				#	os.mkdir(dcorr)
@@ -238,9 +239,12 @@ def main():
 				#num = d.replace('t','')
 				#cmd += " && cp tomostacker_01/stack.st ../tiltseries_compiled/stack_" + str(num) + ".st"
 				#cmd += " && cp tomostacker_01/stack.rawtlt ../tiltseries_compiled/stack_" + str(num) + ".rawtlt"
-			
+			'''
 
 			if options.tilt_stacker_path:
+				print("\n\n\n\n(tomo_tilt_allocate_files)!!!!!!!!!outfile={}".format(outfile))
+				print(f"passed to tomo_tilt_stacker tag={tag}")
+
 				cmd += " && python3 " + options.tilt_stacker_path + " --input .mrc --tag " + tag
 			else:
 				cmd += " && e2tomo_tiltstacker.py --input .mrc --tag " + tag
@@ -337,12 +341,12 @@ def distributefiles(options,tidsdict,imgs,mdocs):
 		for img in imgs:
 			stem,ext = os.path.splitext(os.path.basename(img))
 			if options.verbose > 5:
-				print("\n(e2allocate_files.py)(distributefiles) looking for id={} in img={}".format(tid,img))
+				print("\n(tomo_tilt_allocate_files.py)(distributefiles) looking for id={} in img={}".format(tid,img))
 	
 			if tid.replace('_','') in img.split('_')[options.idposition]:
 				if options.verbose:
-					print("\n(e2allocate_files.py)(distributefiles) found img={} with id={}".format(img,tid))
-					print("\n(e2allocate_files.py)(distributefiles) I will create a symlink from img={} to newlocation={}".format(img,directory+'/'+img))
+					print("\n(tomo_tilt_allocate_files.py)(distributefiles) found img={} with id={}".format(img,tid))
+					print("\n(tomo_tilt_allocate_files.py)(distributefiles) I will create a symlink from img={} to newlocation={}".format(img,directory+'/'+img))
 
 				if img not in os.listdir(os.getcwd()+'/mrcs'):
 					try:
