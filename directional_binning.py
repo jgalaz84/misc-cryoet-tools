@@ -1,3 +1,9 @@
+
+#!/usr/bin/env python
+#====================
+#Author: Jesus Galaz-Montoya - 014/Jan/2025, Last update: 01/2025
+#====================
+
 import argparse
 import numpy as np
 from EMAN2 import *
