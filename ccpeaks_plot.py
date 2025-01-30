@@ -102,7 +102,54 @@ def calculate_effect_size(data1, data2):
         method = "Rank-biserial correlation"
     return p_value, effect_size, method
 
+def plot_violin(data1, data2, filenames, output_dir):
+    """Generates a violin plot comparing NCC peak distributions with relevant statistics, including number of peaks (N)."""
+    
+    p_value, effect_size, method = calculate_effect_size(data1, data2)
+    normal1, normal2 = is_normal(data1), is_normal(data2)
 
+    fig, ax = plt.subplots(figsize=(8, 8))
+    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
+
+    # Customizing violin colors
+    colors = ['blue', 'orange']
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(colors[i])
+        pc.set_edgecolor('black')
+        pc.set_alpha(0.6)
+
+    # Ensure mean and median lines are clearly distinguishable
+    if 'cmeans' in parts:
+        parts['cmeans'].set_linestyle('--')  # Dashed style for means
+        parts['cmeans'].set_linewidth(2)
+        parts['cmeans'].set_color('red')
+    
+    if 'cmedians' in parts:
+        parts['cmedians'].set_linestyle('-')  # Solid style for medians
+        parts['cmedians'].set_linewidth(2)
+        parts['cmedians'].set_color('black')
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(filenames, rotation=30, ha='right')  # Prevent overlapping labels
+    ax.set_ylabel("NCC Peak Values")
+    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
+
+    # Adjust statistics box placement dynamically to avoid overlapping the title
+    max_y = max(max(data1), max(data2))
+    min_y = min(min(data1), min(data2))
+    y_offset = (max_y - min_y) * 0.2  # Increase offset for better spacing
+
+    for i, data in enumerate([data1, data2]):
+        mean_val, median_val = np.mean(data), np.median(data)
+        ax.text(i + 1, max_y + y_offset, 
+                f"N={len(data)}\nGaussian: {is_normal(data)}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
+                ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "ncc_violin_plot.png"))
+    plt.close()
+
+'''
 def plot_violin(data1, data2, filenames, output_dir):
     """Generates a violin plot comparing NCC peak distributions with relevant statistics, including number of peaks (N)."""
     
@@ -124,19 +171,6 @@ def plot_violin(data1, data2, filenames, output_dir):
         parts['cmedians'].set_linewidth(2)
         parts['cmedians'].set_color('black')
 
-    #if 'cmeans' in parts:
-    #    for line in parts['cmeans']:
-    #        line.set_linestyle('--')  # Dashed style for means
-    #        line.set_linewidth(2)
-    #        line.set_color('red')
-    
-    #if 'cmedians' in parts:
-    #    for line in parts['cmedians']:
-    #        line.set_linestyle('-')  # Solid style for medians
-    #        line.set_linewidth(2)
-    #        line.set_color('black')
-    
-
     colors = ['blue', 'orange']
     for i, pc in enumerate(parts['bodies']):
         pc.set_facecolor(colors[i])
@@ -155,73 +189,11 @@ def plot_violin(data1, data2, filenames, output_dir):
         ax.text(i + 1, max(data) + text_y_offset, 
                 f"N={len(data)}\nGaussian: {is_normal(data)}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
                 ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "ncc_violin_plot.png"))
-    plt.close()
-    
-'''
-def plot_violin(data1, data2, filenames, output_dir):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics, including number of peaks (N)."""
-    
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-
-    fig, ax = plt.subplots(figsize=(6, 8))
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-
-    # Customizing mean and median appearance
-    for line in parts['cmeans']:  # Mean lines
-        line.set_linestyle('--')  # Dashed style for means
-        line.set_linewidth(2)
-        line.set_color('red')
-
-    for line in parts['cmedians']:  # Median lines
-        line.set_linestyle('-')  # Solid style for medians
-        line.set_linewidth(2)
-        line.set_color('black')
-
-    colors = ['blue', 'orange']
-    
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(filenames)
-    ax.set_ylabel("NCC Peak Values")
-    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-
-    # Add text with the number of peaks (N), Gaussianity, mean, and median above each violin plot
-
-    
-    #max_y = max(max(data1), max(data2))
-    #y_offset = (max_y - min(min(data1), min(data2))) * 0.1  # Adjust text positioning
-    #
-    #for i, data in enumerate([data1, data2]):
-    #    mean_val, median_val = np.mean(data), np.median(data)
-    #    ax.text(i + 1, max_y + y_offset, 
-    #            f"N={len(data)}\nGaussian: {normal1 if i == 0 else normal2}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
-    #            ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-    #            
-
-    # Adjust text placement to prevent overlap
-    text_y_offset = max(max(data1), max(data2)) * 0.05
-    for i, data in enumerate([data1, data2]):
-        mean_val, median_val = np.mean(data), np.median(data)
-        ax.text(i + 1, max(data) + text_y_offset, 
-                f"N={len(data)}\nGaussian: {is_normal(data)}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
-                ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "ncc_violin_plot.png"))
     plt.close()
     '''
-
 
 def main():
     parser = argparse.ArgumentParser(description="Compute 3D NCC maps and compare peak distributions.")
