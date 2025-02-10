@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Author: Jesus Galaz-Montoya 2024; last modification: Sep/03/2024
+# Author: Jesus Galaz-Montoya 2024; last modification: Feb/10/2025
 
 import h5py
 import argparse
@@ -62,11 +62,17 @@ def load_and_process_data(file_path):
     }
     global_extreme_slices = {key: {'min': (None, float('inf'), None), 'max': (None, float('-inf'), None)} for key in global_metrics}
 
+    #for vol_idx in range(num_volumes):
+    #    image_3d = image_stack[vol_idx]
+    #    print(f"Calculating stats for image n={vol_idx+1}/{num_volumes} in stack={file_path}")
+    #
+    #    metrics, extreme_slices = calculate_metrics_for_images(image_3d)
+
     for vol_idx in range(num_volumes):
         image_3d = image_stack[vol_idx]
         print(f"Calculating stats for image n={vol_idx+1}/{num_volumes} in stack={file_path}")
-
-        metrics, extreme_slices = calculate_metrics_for_images(image_3d)
+        # Pass iteration=0 and the current volume index
+        metrics, extreme_slices = calculate_metrics_for_images(image_3d, iteration=0, volume_idx=vol_idx)
 
         for key in global_metrics:
             global_metrics[key].extend(metrics[key])
@@ -109,20 +115,8 @@ def create_output_directory(base_dir):
     os.makedirs(output_dir)
     return output_dir
 
-'''
-def calculate_metrics_for_images(image_3d):
-    print("\nCalculating metrics for loaded image data...")  # Print statement for clarity
-    metrics = {
-        'kurtosis': [], 'entropy': [], 'contrast': [], 'homogeneity': [],
-        'energy': [], 'correlation': [], 'mean': [], 'std_dev': []
-    }
-    
-    # Process the slices
-    extreme_slices = process_slices(image_3d, metrics)
-    return metrics, extreme_slices
-    '''
 
-def calculate_metrics_for_images(image_3d, iteration, volume_idx):
+def calculate_metrics_for_images(image_3d, iteration=0, volume_idx=0):
     print("\nCalculating metrics for loaded image data...")  # Clarify start
     metrics = {
         'kurtosis': [], 'entropy': [], 'contrast': [],
@@ -135,58 +129,7 @@ def calculate_metrics_for_images(image_3d, iteration, volume_idx):
     return metrics, extremes
 
 
-
 '''
-def process_slices(image_3d, metrics):
-    """Process all slices from a 3D volume and calculate statistical metrics."""
-   # print(f'\nAnalyzing slices...')
-    
-    extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
-    
-    num_slices = image_3d.shape[0]  # Assuming the first dimension corresponds to the slices
-    
-    for idx in range(num_slices):
-        slice_2d = image_3d[idx, :, :]  # Extract the 2D slice from the 3D volume (z-axis)
-        mean = np.mean(slice_2d)
-        sigma = np.std(slice_2d)
-
-        if sigma > 0:
-            # Normalize the 2D slice (assuming float32/float64 data requires scaling)
-            slice_normalized = (slice_2d * 255).astype(np.uint8) if slice_2d.dtype in [np.float32, np.float64] else slice_2d
-            
-            # Calculate GLCM for the 2D slice
-            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
-            
-            feature_values = {
-                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
-                'entropy': shannon_entropy(slice_normalized),
-                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
-                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
-                'energy': graycoprops(glcm, 'energy')[0].mean(),
-                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
-                'mean': mean,
-                'std_dev': sigma
-            }
-            
-            # Append metrics and check for extremes
-            for key, value in feature_values.items():
-                metrics[key].append(value)
-                if value < extremes[key]['min'][1]:
-                    extremes[key]['min'] = (idx, value)
-                if value > extremes[key]['max'][1]:
-                    extremes[key]['max'] = (idx, value)
-        else:
-            sys.stdout.write(f"Skipping slice {idx} due to zero standard deviation")
-            sys.stdout.flush()
-
-        # In-place printing with slice index starting from 1
-        sys.stdout.write(f"\rProcessing slice {idx+1}/{num_slices}, slice shape: {slice_2d.shape}")
-        sys.stdout.flush()
-    
-    print()  # Move to the next line after processing all slices
-    return extremes
-    '''
-
 def process_slices(image_3d, metrics, iteration, volume_idx):
     """Process slices and calculate metrics with dynamic progress updates."""
     num_slices = image_3d.shape[0]
@@ -234,8 +177,49 @@ def process_slices(image_3d, metrics, iteration, volume_idx):
     print(f"Completed Volume {volume_idx+1} in Iteration {iteration+1}.")
 
     return extremes
+    '''
 
+def process_slices(image_3d, metrics, iteration, volume_idx):
+    num_slices = image_3d.shape[0]
+    # Initialize extremes as tuples: (slice_index, value)
+    extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
 
+    for idx in range(num_slices):
+        slice_2d = image_3d[idx, :, :]
+        mean = np.mean(slice_2d)
+        sigma = np.std(slice_2d)
+        # Progress update (omitted here for brevity)
+
+        if sigma > 0:
+            # Normalize slice if needed
+            slice_normalized = (slice_2d * 255).astype(np.uint8) if slice_2d.dtype in [np.float32, np.float64] else slice_2d
+            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4],
+                                 levels=256, symmetric=True, normed=True)
+            
+            feature_values = {
+                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
+                'entropy': shannon_entropy(slice_normalized),
+                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
+                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
+                'energy': graycoprops(glcm, 'energy')[0].mean(),
+                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
+                'mean': mean,
+                'std_dev': sigma
+            }
+            
+            for key, value in feature_values.items():
+                metrics[key].append(value)
+                # Update the extreme tuple if a new extreme is found:
+                if value < extremes[key]['min'][1]:
+                    extremes[key]['min'] = (idx, value)
+                if value > extremes[key]['max'][1]:
+                    extremes[key]['max'] = (idx, value)
+    # Clear dynamic progress and report completion
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.flush()
+    print(f"Completed Volume {volume_idx+1} in Iteration {iteration+1}.")
+    
+    return extremes
 
 
 def is_normal(data, alpha=0.05):
@@ -483,6 +467,153 @@ def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices
             f.write(f'{key}: p={p_value:.6f}, {label}\n')
 
 
+
+def save_raw_data(metrics1, metrics2, output_dir):
+    """Save raw data to text files for each metric."""
+    for metric in metrics1:
+        np.savetxt(os.path.join(output_dir, f'{metric}_dataset1.txt'), np.array(metrics1[metric]), fmt='%s')
+        np.savetxt(os.path.join(output_dir, f'{metric}_dataset2.txt'), np.array(metrics2[metric]), fmt='%s')
+
+def plot_metrics(metrics, output_dir):
+    """Plot metrics in grouped histograms."""
+    keys = ['contrast', 'homogeneity', 'energy', 'correlation', 'kurtosis', 'entropy', 'mean', 'std_dev']
+    fig, axes = plt.subplots(2, 4, figsize=(18, 12))  # Adjust layout to fit all keys on two rows
+    for i, key in enumerate(keys):
+        ax = axes[i // 4, i % 4]
+        data = np.array(metrics[key])
+        if data.size > 0:
+            ax.hist(data, bins='auto', alpha=0.7)
+            ax.set_title(f'{key} Distribution')
+            ax.set_xlabel(key)
+            ax.set_ylabel('Frequency')
+            np.savetxt(os.path.join(output_dir, f'{key}_data.txt'), data)  # Save histogram data
+        else:
+            ax.set_visible(False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "metrics_distributions.png"))
+    plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Process image files to compute metrics.")
+    parser.add_argument('--input', required=True, help="Comma-separated file paths for one or two image files.")
+    parser.add_argument('--output_dir', default="molstats", help="Directory to save the outputs.")
+    parser.add_argument('--data_labels', default=None, help="Comma-separated labels for the datasets.")
+    args = parser.parse_args()
+
+    input_files = args.input.split(',')
+    output_dir = create_output_directory(args.output_dir)
+    logger = setup_logger(output_dir)
+
+    try:
+        logger.info("Program started")
+        start_time = time.time()
+        if len(input_files) == 2:
+            # Load and process data for the first file
+            image_3d1, metrics1, extreme_slices1 = load_and_process_data(input_files[0])
+            # Load and process data for the second file
+            image_3d2, metrics2, extreme_slices2 = load_and_process_data(input_files[1])
+
+            #save_raw_data(metrics1, output_dir)  # Saving raw data after metrics calculation
+            #save_raw_data(metrics2, output_dir)
+
+            save_raw_data(metrics1, metrics2, output_dir)
+
+            haralick_keys = ['contrast', 'correlation', 'energy', 'homogeneity']
+            other_metrics_keys = ['kurtosis', 'entropy', 'mean', 'std_dev']
+
+            # Plotting Haralick features
+            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, haralick_keys, "haralick_features.png", data_labels=args.data_labels)
+
+            # Plotting other metric
+            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, other_metrics_keys, "other_metrics.png", data_labels=args.data_labels)
+        elif len(input_files) == 1:
+            # Load and process data for the single file
+            image_3d, metrics, extreme_slices = load_and_process_data(input_files[0])
+            # Plot metrics
+            #plot_metrics(metrics, output_dir, extreme_slices)
+            plot_metrics(metrics, output_dir)
+        else:
+            logger.error("Incorrect number of input files. Please provide one or two image files.")
+    except Exception as e:
+        logger.error(f"Program failed with error: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        elapsed_time = time.time() - start_time
+        logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
+        for handler in logger.handlers:
+            handler.close()
+            logger.removeHandler(handler)
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+'''
+def calculate_metrics_for_images(image_3d):
+    print("\nCalculating metrics for loaded image data...")  # Print statement for clarity
+    metrics = {
+        'kurtosis': [], 'entropy': [], 'contrast': [], 'homogeneity': [],
+        'energy': [], 'correlation': [], 'mean': [], 'std_dev': []
+    }
+    
+    # Process the slices
+    extreme_slices = process_slices(image_3d, metrics)
+    return metrics, extreme_slices
+    '''
+
+'''
+def process_slices(image_3d, metrics):
+    """Process all slices from a 3D volume and calculate statistical metrics."""
+   # print(f'\nAnalyzing slices...')
+    
+    extremes = {key: {'min': (None, float('inf')), 'max': (None, float('-inf'))} for key in metrics}
+    
+    num_slices = image_3d.shape[0]  # Assuming the first dimension corresponds to the slices
+    
+    for idx in range(num_slices):
+        slice_2d = image_3d[idx, :, :]  # Extract the 2D slice from the 3D volume (z-axis)
+        mean = np.mean(slice_2d)
+        sigma = np.std(slice_2d)
+
+        if sigma > 0:
+            # Normalize the 2D slice (assuming float32/float64 data requires scaling)
+            slice_normalized = (slice_2d * 255).astype(np.uint8) if slice_2d.dtype in [np.float32, np.float64] else slice_2d
+            
+            # Calculate GLCM for the 2D slice
+            glcm = graycomatrix(slice_normalized, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
+            
+            feature_values = {
+                'kurtosis': kurtosis(slice_normalized.ravel(), fisher=True),
+                'entropy': shannon_entropy(slice_normalized),
+                'contrast': graycoprops(glcm, 'contrast')[0].mean(),
+                'homogeneity': graycoprops(glcm, 'homogeneity')[0].mean(),
+                'energy': graycoprops(glcm, 'energy')[0].mean(),
+                'correlation': graycoprops(glcm, 'correlation')[0].mean(),
+                'mean': mean,
+                'std_dev': sigma
+            }
+            
+            # Append metrics and check for extremes
+            for key, value in feature_values.items():
+                metrics[key].append(value)
+                if value < extremes[key]['min'][1]:
+                    extremes[key]['min'] = (idx, value)
+                if value > extremes[key]['max'][1]:
+                    extremes[key]['max'] = (idx, value)
+        else:
+            sys.stdout.write(f"Skipping slice {idx} due to zero standard deviation")
+            sys.stdout.flush()
+
+        # In-place printing with slice index starting from 1
+        sys.stdout.write(f"\rProcessing slice {idx+1}/{num_slices}, slice shape: {slice_2d.shape}")
+        sys.stdout.flush()
+    
+    print()  # Move to the next line after processing all slices
+    return extremes
+    '''
 
 
 '''
@@ -1017,83 +1148,3 @@ def plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices
             f.write(f'{key}: p={p_value:.4f}, {label}\n')
 
 '''
-
-def save_raw_data(metrics1, metrics2, output_dir):
-    """Save raw data to text files for each metric."""
-    for metric in metrics1:
-        np.savetxt(os.path.join(output_dir, f'{metric}_dataset1.txt'), np.array(metrics1[metric]), fmt='%s')
-        np.savetxt(os.path.join(output_dir, f'{metric}_dataset2.txt'), np.array(metrics2[metric]), fmt='%s')
-
-def plot_metrics(metrics, output_dir):
-    """Plot metrics in grouped histograms."""
-    keys = ['contrast', 'homogeneity', 'energy', 'correlation', 'kurtosis', 'entropy', 'mean', 'std_dev']
-    fig, axes = plt.subplots(2, 4, figsize=(18, 12))  # Adjust layout to fit all keys on two rows
-    for i, key in enumerate(keys):
-        ax = axes[i // 4, i % 4]
-        data = np.array(metrics[key])
-        if data.size > 0:
-            ax.hist(data, bins='auto', alpha=0.7)
-            ax.set_title(f'{key} Distribution')
-            ax.set_xlabel(key)
-            ax.set_ylabel('Frequency')
-            np.savetxt(os.path.join(output_dir, f'{key}_data.txt'), data)  # Save histogram data
-        else:
-            ax.set_visible(False)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "metrics_distributions.png"))
-    plt.close(fig)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Process image files to compute metrics.")
-    parser.add_argument('--input', required=True, help="Comma-separated file paths for one or two image files.")
-    parser.add_argument('--output_dir', default="molstats", help="Directory to save the outputs.")
-    parser.add_argument('--data_labels', default=None, help="Comma-separated labels for the datasets.")
-    args = parser.parse_args()
-
-    input_files = args.input.split(',')
-    output_dir = create_output_directory(args.output_dir)
-    logger = setup_logger(output_dir)
-
-    try:
-        logger.info("Program started")
-        start_time = time.time()
-        if len(input_files) == 2:
-            # Load and process data for the first file
-            image_3d1, metrics1, extreme_slices1 = load_and_process_data(input_files[0])
-            # Load and process data for the second file
-            image_3d2, metrics2, extreme_slices2 = load_and_process_data(input_files[1])
-
-            #save_raw_data(metrics1, output_dir)  # Saving raw data after metrics calculation
-            #save_raw_data(metrics2, output_dir)
-
-            save_raw_data(metrics1, metrics2, output_dir)
-
-            haralick_keys = ['contrast', 'correlation', 'energy', 'homogeneity']
-            other_metrics_keys = ['kurtosis', 'entropy', 'mean', 'std_dev']
-
-            # Plotting Haralick features
-            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, haralick_keys, "haralick_features.png", data_labels=args.data_labels)
-
-            # Plotting other metric
-            plot_comparative_violin_plots(metrics1, metrics2, output_dir, extreme_slices1, extreme_slices2, other_metrics_keys, "other_metrics.png", data_labels=args.data_labels)
-        elif len(input_files) == 1:
-            # Load and process data for the single file
-            image_3d, metrics, extreme_slices = load_and_process_data(input_files[0])
-            # Plot metrics
-            plot_metrics(metrics, output_dir, extreme_slices)
-        else:
-            logger.error("Incorrect number of input files. Please provide one or two image files.")
-    except Exception as e:
-        logger.error(f"Program failed with error: {e}")
-        logger.error(traceback.format_exc())
-    finally:
-        elapsed_time = time.time() - start_time
-        logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
-        for handler in logger.handlers:
-            handler.close()
-            logger.removeHandler(handler)
-
-
-if __name__ == '__main__':
-    main()
