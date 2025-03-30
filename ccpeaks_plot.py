@@ -1,26 +1,4 @@
 #!/usr/bin/env python
-#
-# Author: Jesus Galaz-Montoya 2025
-# Last modification: Mar/21/2025
-#
-# FEATURES:
-#  1) Computes 3D cross-correlation (CC) maps between tomograms and one or more templates.
-#  2) Uses a greedy non-maximum suppression (NMS) algorithm:
-#       - Finds the highest voxel in the CC map,
-#       - Ignores all voxels within --diameter of that maximum,
-#       - Then finds the next highest surviving voxel,
-#       - Repeats until --npeaks are found (if --npeaks > 0; if 0, keep all).
-#  3) Does NOT apply any threshold by default (i.e. --ccc_thresh defaults to 0).
-#  4) Saves per-template results (in "correlation_files") and combined final peaks (in "raw_coordinates").
-#  5) Optionally saves the full CC maps (now referred to as "cc_maps") for each (image,template) pair.
-#  6) Extensive inline comments, verbose logging, and progress bars via tqdm.
-#
-# USAGE (example):
-#   python ccpeaks_plot.py --input tomo1.mrc,tomo2.hdf --template templ.hdf \
-#      --output_dir my_output --npeaks 34 --diameter 38 --save_coords_map_r 4 --ccc_thresh 0 --verbose 2
-#
-# NOTE: Requires tqdm (pip install tqdm)
-#
 
 import argparse
 import os
@@ -38,18 +16,23 @@ from mpl_toolkits.mplot3d import Axes3D
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
 from scipy.ndimage import gaussian_filter
-from tqdm import tqdm  # For progress bar
+from tqdm import tqdm
+import psutil
+import csv
+
+try:
+    from EMAN2 import EMData, EMNumPy
+    EMAN2_AVAILABLE = True
+except ImportError:
+    EMAN2_AVAILABLE = False
+
+_VERBOSE = False  # Global for controlling debug logs in iterative NMS
 
 #########################
 # Utility functions
 #########################
 
 def create_output_directory(base_dir):
-    """
-    Create a new output directory by appending _00, _01, etc.
-    Also creates subfolders: correlation_files, coordinate_plots, and raw_coordinates.
-    Returns the created directory path.
-    """
     i = 0
     while os.path.exists(f"{base_dir}_{i:02}"):
         i += 1
@@ -61,11 +44,6 @@ def create_output_directory(base_dir):
     return output_dir
 
 def setup_logging(output_dir, verbose_level):
-    """
-    Setup logging to both a file (in output_dir) and console.
-    Verbosity:
-      0 -> ERROR, 1 -> WARNING, 2 -> INFO, 3 -> DEBUG.
-    """
     log_file = os.path.join(output_dir, "run.log")
     if verbose_level <= 0:
         log_level = logging.ERROR
@@ -78,19 +56,12 @@ def setup_logging(output_dir, verbose_level):
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
     )
     logging.info("Command: " + " ".join(sys.argv))
     return log_file
 
 def parse_mrc_apix_and_mean(file_path):
-    """
-    Attempt to parse pixel size (apix) and compute mean intensity for an MRC file.
-    Returns (apix, mean_intensity) or (None, None) if unavailable.
-    """
     try:
         with mrcfile.open(file_path, permissive=True) as mrc:
             data = mrc.data
@@ -110,10 +81,6 @@ def parse_mrc_apix_and_mean(file_path):
         return (None, None)
 
 def parse_hdf_apix_and_mean(file_path):
-    """
-    Attempt to parse pixel size (apix) and compute mean intensity for an HDF file.
-    Returns (apix, mean_intensity) or (None, None) if not found.
-    """
     try:
         with h5py.File(file_path, 'r') as f:
             apix = None
@@ -139,59 +106,53 @@ def parse_hdf_apix_and_mean(file_path):
         return (None, None)
 
 def load_image(file_path):
-    """
-    Load a 3D image or stack from an MRC or HDF file.
-    Returns the image array, or None on error.
-    """
     ext = os.path.splitext(file_path)[1].lower()
     try:
         if ext in ['.hdf', '.h5']:
             with h5py.File(file_path, 'r') as file:
                 dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
-                image_stack = np.array([file[ds][:] for ds in dataset_paths])
+                images = [file[ds][:] for ds in dataset_paths]
+            return images
         elif ext == '.mrc':
             with mrcfile.open(file_path, permissive=True) as mrc:
-                image_stack = mrc.data
+                data = mrc.data
+                if data.ndim == 3:
+                    return [data]
+                elif data.ndim >= 4:
+                    return [d for d in data]
+                else:
+                    return [data]
         else:
             raise ValueError(f"Unsupported file format: {ext}")
     except Exception as e:
         logging.error(f"Error loading file {file_path}: {e}")
         return None
-    return image_stack
 
-def check_apix_and_intensity(tomo_path, template_path):
+def check_apix(tomo_path, template_path):
     """
-    Compare approximate pixel size (apix) and mean intensity for a tomogram vs. a template.
-    Logs a warning if they differ by more than a factor of 2.
+    Checks pixel size (apix) compatibility between template and tomogram.
+    Only warns about apix, not intensity differences (which are expected for normalized templates).
     """
     tomo_ext = os.path.splitext(tomo_path)[1].lower()
     template_ext = os.path.splitext(template_path)[1].lower()
     if tomo_ext == '.mrc':
-        tomo_apix, tomo_mean = parse_mrc_apix_and_mean(tomo_path)
+        tomo_apix, _ = parse_mrc_apix_and_mean(tomo_path)
     elif tomo_ext in ['.hdf', '.h5']:
-        tomo_apix, tomo_mean = parse_hdf_apix_and_mean(tomo_path)
+        tomo_apix, _ = parse_hdf_apix_and_mean(tomo_path)
     else:
-        tomo_apix, tomo_mean = (None, None)
+        tomo_apix = None
     if template_ext == '.mrc':
-        tpl_apix, tpl_mean = parse_mrc_apix_and_mean(template_path)
+        tpl_apix, _ = parse_mrc_apix_and_mean(template_path)
     elif template_ext in ['.hdf', '.h5']:
-        tpl_apix, tpl_mean = parse_hdf_apix_and_mean(template_path)
+        tpl_apix, _ = parse_hdf_apix_and_mean(template_path)
     else:
-        tpl_apix, tpl_mean = (None, None)
+        tpl_apix = None
     if tomo_apix and tpl_apix:
         ratio = tpl_apix / tomo_apix if tomo_apix != 0 else None
         if ratio and (ratio < 0.5 or ratio > 2.0):
             logging.warning(f"Template apix {tpl_apix:.2f} vs. tomogram apix {tomo_apix:.2f} differs by >2x.")
-    if tomo_mean and tpl_mean:
-        ratio = tpl_mean / tomo_mean if tomo_mean != 0 else None
-        if ratio and (ratio < 0.5 or ratio > 2.0):
-            logging.warning(f"Template mean intensity {tpl_mean:.2f} vs. tomogram mean intensity {tomo_mean:.2f} differs by >2x.")
 
 def adjust_template(template, target_shape):
-    """
-    Adjust the template to match the target shape by centering and clipping or padding.
-    Returns a new array of shape 'target_shape'.
-    """
     t_shape = template.shape
     new_template = np.zeros(target_shape, dtype=template.dtype)
     slices_target = []
@@ -209,26 +170,27 @@ def adjust_template(template, target_shape):
     return new_template
 
 def compute_ncc_map_3d_single(image, template):
-    """
-    Compute the 3D normalized cross-correlation (CC) map between image and template.
-    If shapes differ, adjusts the template.
-    Returns the CC map.
-    """
+    """Compute normalized cross-correlation map of 'image' and 'template' by FFT-based correlation."""
     if image.shape != template.shape:
         template = adjust_template(template, image.shape)
     cc_map = correlate(image, template, mode='same', method='fft')
+    # Normalize
     cc_map = (cc_map - np.mean(cc_map)) / np.std(cc_map)
     return cc_map
 
+#########################
+# Local NMS methods
+#########################
+
+def numpy_to_emdata(a):
+    return EMNumPy.numpy2em(a)
+
+# Original reliable non_maximum_suppression function
 def non_maximum_suppression(cc_map, n_peaks, diameter):
     """
-    Perform greedy non-maximum suppression on the CC map:
-      1. Flatten and sort all voxels in descending order.
-      2. Iterate over sorted candidates; accept a candidate if it is not within
-         'diameter' voxels of any already accepted candidate.
-      3. Stop when n_peaks candidates have been accepted (if n_peaks > 0).
-         If n_peaks==0, return all candidates.
-    Returns a list of (x, y, z, value).
+    This is the original robust NMS algorithm that correctly handles n_peaks.
+    Returns list of (x, y, z, value) for the top peaks.
+    Guarantees consistent results regardless of input sizes.
     """
     flat = cc_map.ravel()
     sorted_indices = np.argsort(flat)[::-1]
@@ -236,6 +198,11 @@ def non_maximum_suppression(cc_map, n_peaks, diameter):
     accepted = []
     for idx, coord in enumerate(coords):
         candidate_val = flat[sorted_indices[idx]]
+        
+        # Skip values that are -inf (could be from thresholding)
+        if candidate_val == -np.inf:
+            continue
+            
         too_close = False
         for (ax, ay, az, aval) in accepted:
             if np.linalg.norm(coord - np.array([ax, ay, az])) < diameter:
@@ -247,89 +214,403 @@ def non_maximum_suppression(cc_map, n_peaks, diameter):
             break
     return accepted
 
+# Optimized version of NMS for faster performance with large peak counts
+def vectorized_non_maximum_suppression(cc_map, n_peaks, diameter):
+    """
+    Vectorized NMS algorithm that uses numpy optimizations for better performance.
+    This function is used only when the user selects 'fallback' method.
+    """
+    # Get all potential peaks in descending order of value
+    flat = cc_map.ravel()
+    
+    # For efficiency, limit initial sorting to the top 10x n_peaks values
+    # This prevents O(n log n) sorting of potentially millions of points
+    if n_peaks > 0:
+        # Efficiently find top candidates - much faster for large arrays
+        min_candidates = min(10 * n_peaks, flat.size)
+        top_indices = np.argpartition(flat, -min_candidates)[-min_candidates:]
+        # Sort just these candidates
+        top_indices = top_indices[np.argsort(flat[top_indices])[::-1]]
+    else:
+        # If n_peaks is 0, we sort all values (this could be very slow for large arrays)
+        top_indices = np.argsort(flat)[::-1]
+    
+    # Convert flat indices to 3D coordinates
+    coords = np.asarray(np.unravel_index(top_indices, cc_map.shape)).T
+    
+    accepted = []
+    # Squared diameter for faster distance calculation
+    diameter_squared = diameter * diameter
+    
+    # Use numpy vectors for faster distance calculations
+    for idx, coord in enumerate(coords):
+        # Skip early if we've found enough peaks
+        if n_peaks > 0 and len(accepted) >= n_peaks:
+            break
+            
+        candidate_val = flat[top_indices[idx]]
+        
+        # Skip values that are -inf (could be from thresholding)
+        if candidate_val == -np.inf:
+            continue
+            
+        # Check if this peak is too close to any accepted peak
+        too_close = False
+        if accepted:
+            # Convert accepted peaks to numpy array for vectorized distance calc
+            accepted_coords = np.array([[x, y, z] for (x, y, z, _) in accepted])
+            
+            # Compute squared distances to all accepted peaks at once
+            # This is much faster than looping through each accepted peak
+            diff = accepted_coords - coord
+            sq_distances = np.sum(diff * diff, axis=1)
+            
+            # If any distance is less than diameter, it's too close
+            if np.any(sq_distances < diameter_squared):
+                too_close = True
+                
+        if not too_close:
+            accepted.append((int(coord[0]), int(coord[1]), int(coord[2]), float(candidate_val)))
+    
+    return accepted
+
+def mask_out_region_xyz(arr, x0, y0, z0, diameter):
+    """
+    Sets arr[z, y, x] = -inf for all points within 'diameter' of (x0,y0,z0).
+    
+    Parameters:
+    - arr: NumPy array with shape (nz, ny, nx)
+    - x0, y0, z0: coordinates of the center point in (x,y,z) format
+    - diameter: diameter of the sphere to mask
+    
+    Note: This function properly handles the coordinate conversion from
+    input (x,y,z) coordinates to NumPy's [z,y,x] indexing.
+    """
+    nz, ny, nx = arr.shape
+    dd = diameter**2
+    radius = int(diameter)
+    
+    # Loop using z,y,x iteration order for better cache locality
+    for z in range(max(0, z0 - radius), min(nz, z0 + radius + 1)):
+        for y in range(max(0, y0 - radius), min(ny, y0 + radius + 1)):
+            for x in range(max(0, x0 - radius), min(nx, x0 + radius + 1)):
+                dx = x - x0
+                dy = y - y0
+                dz = z - z0
+                if (dx*dx + dy*dy + dz*dz) <= dd:
+                    # Use NumPy [z,y,x] indexing
+                    arr[z, y, x] = -np.inf
+    return arr
+
+def iterative_nms_eman2(cc_map_np, n_peaks, diameter, cc_thresh, verbose=False):
+    """
+    Modified EMAN2-based NMS with proper n_peaks handling.
+    Uses radius (half of diameter) for masking spheres around detected peaks.
+    Properly handles coordinate system conversion between EMAN2 and NumPy.
+    
+    IMPORTANT: EMAN2 uses (x,y,z) coordinates but NumPy arrays are indexed as [z,y,x]
+    """
+    from EMAN2 import EMNumPy, EMData
+    
+    # Calculate radius as half of the diameter
+    radius = diameter / 2.0
+    radius_squared = radius * radius
+    
+    if verbose:
+        print(f"[DEBUG] iterative_nms_eman2 start, n_peaks={n_peaks}, diameter={diameter:.1f}, radius={radius:.1f}")
+
+    # Work with a copy of the input array
+    arr = cc_map_np.copy().astype(np.float32)
+    shape_nz, shape_ny, shape_nx = arr.shape  # NumPy shape is (z,y,x)
+
+    # Apply threshold if requested
+    if cc_thresh > 0:
+        val_thr = arr.mean() + cc_thresh * arr.std()
+        arr = np.where(arr >= val_thr, arr, -np.inf)
+
+    # Prepare to pick peaks
+    if (not n_peaks) or (n_peaks <= 0):
+        n_peaks = arr.size
+
+    accepted = []
+    
+    # Main peak finding loop
+    for i in range(n_peaks):
+        # Convert to EMData only for finding the maximum location
+        # This is what EMAN2 is good at doing quickly
+        em = EMNumPy.numpy2em(arr)
+        max_val = em["maximum"]
+        
+        # Stop if no more valid peaks
+        if max_val == -np.inf:
+            break
+
+        # Find the location of the maximum value in EMAN2 coordinates (x,y,z)
+        eman_x, eman_y, eman_z = em.calc_max_location()
+        eman_x, eman_y, eman_z = int(eman_x), int(eman_y), int(eman_z)
+        
+        # Back to NumPy for the rest of processing
+        del em  # Free memory
+
+        # IMPORTANT: Convert EMAN2 coordinates (x,y,z) to NumPy array indices [z,y,x]
+        # For array access, we need to use numpy_z = eman_z, numpy_y = eman_y, numpy_x = eman_x
+        
+        if not (0 <= eman_z < shape_nz and 0 <= eman_y < shape_ny and 0 <= eman_x < shape_nx):
+            if verbose:
+                print(f"[WARNING] EMAN2 gave out-of-bounds peak (x={eman_x},y={eman_y},z={eman_z}), ignoring it.")
+        else:
+            # Store the peak in the format (x,y,z,val) as expected by the rest of the code
+            accepted.append((eman_x, eman_y, eman_z, float(max_val)))
+            if verbose:
+                print(f"[DEBUG] EMAN2 peak {i+1}: (x={eman_x}, y={eman_y}, z={eman_z}), val={max_val:.3f}")
+
+        # Explicitly mask out a spherical region around the peak
+        # NOTE: We need to use NumPy indexing [z,y,x] while the peak is in EMAN2 (x,y,z) format
+        z_min = max(0, eman_z - int(radius))
+        z_max = min(shape_nz, eman_z + int(radius) + 1)
+        y_min = max(0, eman_y - int(radius))
+        y_max = min(shape_ny, eman_y + int(radius) + 1)
+        x_min = max(0, eman_x - int(radius))
+        x_max = min(shape_nx, eman_x + int(radius) + 1)
+        
+        # Mask the spherical region in NumPy's [z,y,x] coordinate system
+        for z in range(z_min, z_max):
+            for y in range(y_min, y_max):
+                for x in range(x_min, x_max):
+                    # Check if this point is within the sphere
+                    # The distance calculation needs to match EMAN2 coordinates
+                    if ((x - eman_x)**2 + (y - eman_y)**2 + (z - eman_z)**2) <= radius_squared:
+                        # Access using NumPy [z,y,x] indexing
+                        arr[z, y, x] = -np.inf
+        
+        if verbose and i < 3:  # Only for the first few iterations to avoid excessive output
+            # Check if masking was effective - use NumPy [z,y,x] indexing!
+            if arr[eman_z, eman_y, eman_x] != -np.inf:
+                print(f"[ERROR] Masking failed! Value at peak location after masking: {arr[eman_z, eman_y, eman_x]}")
+            else:
+                print(f"[DEBUG] Masking successful at iteration {i+1}")
+
+    return accepted, arr
+
+def fallback_iterative_nms(cc_map, n_peaks, diameter, cc_thresh, verbose=False):
+    """
+    Non-EMAN2 version of iterative NMS. Used when EMAN2 is not available.
+    
+    This function works with NumPy arrays in [z,y,x] indexing format, but returns
+    peak coordinates in (x,y,z,val) format for compatibility with the rest of the code.
+    
+    Parameters:
+    - cc_map: 3D NumPy array of cross-correlation values, shape (z,y,x)
+    - n_peaks: Number of peaks to find (0 means find all)
+    - diameter: Minimum distance between peaks
+    - cc_thresh: Threshold in sigmas above mean (0 means no threshold)
+    - verbose: Whether to print debug information
+    
+    Returns:
+    - accepted: List of (x,y,z,val) peaks
+    - arr: masked correlation map
+    """
+    arr = cc_map.copy()
+    nz, ny, nx = arr.shape
+
+    # threshold if needed
+    if cc_thresh > 0:
+        val_thr = arr.mean() + cc_thresh * arr.std()
+        arr = np.where(arr >= val_thr, arr, -np.inf)
+
+    if (not n_peaks) or (n_peaks <= 0):
+        n_peaks = arr.size
+
+    accepted = []
+    # Use the simple, reliable algorithm
+    for i in range(n_peaks):
+        max_val = arr.max()
+        if max_val == -np.inf:
+            break
+            
+        max_idx = np.argmax(arr)
+        # NumPy unravel_index gives (z,y,x) for a 3D array with shape (nz,ny,nx)
+        z0, y0, x0 = np.unravel_index(max_idx, arr.shape)
+
+        # Store as (x,y,z,val) as expected by the aggregator
+        accepted.append((x0, y0, z0, float(max_val)))
+        if verbose:
+            print(f"[DEBUG fallback] peak {i+1}: (x={x0}, y={y0}, z={z0}), val={max_val:.3f}")
+
+        # mask_out_region_xyz handles the coordinate conversion correctly
+        arr = mask_out_region_xyz(arr, x0, y0, z0, diameter)
+
+    return accepted, arr
+
 #########################
 # Output saving functions
 #########################
 
-def save_peak_data(output_dir, filename, template_str, image_idx, peak_coords, peak_values, total_templates):
-    """
-    Save the final peaks for one (image, template) pair into a text file in "correlation_files".
-    Columns: Template, X, Y, Z, CC_Value.
-    Note: All instances of "ccc" have been renamed to "cc".
-    """
-    image_str = str(image_idx).zfill(3)
-    out_file = os.path.join(output_dir, 'correlation_files', f'cc_{filename}_T{template_str}_I{image_str}.txt')
-    header = f"{'Template':<10} {'X':>5} {'Y':>5} {'Z':>5} {'CC_Value':>10}"
-    with open(out_file, 'w') as f:
-        f.write(header + "\n")
-        for i in range(len(peak_values)):
-            x, y, z = map(int, peak_coords[i])
-            val = float(peak_values[i])
-            f.write(f"{template_str:<10} {x:5d} {y:5d} {z:5d} {val:10.6f}\n")
-    logging.info(f"Saved CC peaks to {out_file}")
-
 def plot_3d_peak_coordinates(output_dir, filename, template_str, image_idx, peak_coords):
-    """
-    Create a 3D scatter plot of the peaks for one (image, template) pair and save as PNG in "coordinate_plots".
-    """
-    if peak_coords.size == 0:
+    if np.asarray(peak_coords).size == 0:
         return
     fig = plt.figure(figsize=(8,8))
     ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(peak_coords[:,0], peak_coords[:,1], peak_coords[:,2], c='red', marker='o')
+    ax.scatter(peak_coords[:,0], peak_coords[:,1], peak_coords[:,2], marker='o')
     ax.set_xlabel("X Coordinate")
     ax.set_ylabel("Y Coordinate")
     ax.set_zlabel("Z Coordinate")
     ax.set_title("Top CC Peak Locations")
     image_str = str(image_idx).zfill(3)
     out_png = os.path.join(output_dir, 'coordinate_plots', f'cc_{filename}_T{template_str}_I{image_str}.png')
-    # Note: compress_level is no longer supported by savefig in newer matplotlib.
     plt.savefig(out_png, dpi=150)
     plt.close()
     logging.info(f"Saved 3D peak plot to {out_png}")
 
 def place_sphere(volume, center, radius):
     """
-    Mark a sphere (of ones) in 'volume' at 'center' with integer radius 'radius'.
-    Used for generating the coords_map.
+    Places a sphere in a 3D volume by setting voxels to 1.
+    - volume: 3D NumPy array with shape (z,y,x)
+    - center: (x,y,z) coordinates of sphere center
+    - radius: radius of the sphere
+    
+    Note: This handles the coordinate conversion from (x,y,z) -> [z,y,x]
     """
     x0, y0, z0 = center
-    nx, ny, nz = volume.shape
-    for x in range(x0 - radius, x0 + radius + 1):
-        if x < 0 or x >= nx:
+    nz, ny, nx = volume.shape  # NumPy array has shape (z,y,x)
+    r2 = radius**2
+    
+    # Convert x,y,z coords to NumPy's [z,y,x] indexing
+    for z in range(z0 - radius, z0 + radius + 1):
+        if z < 0 or z >= nz:
             continue
         for y in range(y0 - radius, y0 + radius + 1):
             if y < 0 or y >= ny:
                 continue
-            for z in range(z0 - radius, z0 + radius + 1):
-                if z < 0 or z >= nz:
+            for x in range(x0 - radius, x0 + radius + 1):
+                if x < 0 or x >= nx:
                     continue
-                if (x - x0)**2 + (y - y0)**2 + (z - z0)**2 <= radius**2:
-                    volume[x, y, z] = 1
+                if (x - x0)**2 + (y - y0)**2 + (z - z0)**2 <= r2:
+                    # Access using NumPy [z,y,x] indexing
+                    volume[z, y, x] = 1
 
 def save_coords_map_as_hdf(coords_map_stack, out_path):
     """
-    Save a list of 3D volumes (coords_map_stack) to an HDF file in EMAN2 style:
-      /MDF/images/0/image, /MDF/images/1/image, etc.
+    Save coordinate maps as HDF stack in a format compatible with EMAN2.
+    Creates a structure with MDF/images/i/image datasets.
     """
+    # Create parent directories if they don't exist
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    
     with h5py.File(out_path, 'w') as f:
+        # Add attributes needed for EMAN2 compatibility
+        f.attrs['appion_version'] = np.string_('ccpeaks_plot')
+        f.attrs['MDF'] = np.string_('1')  # This is needed for EMAN2 compatibility
+        
+        # Create group structure
+        mdf = f.create_group('MDF')
+        mdf.attrs['version'] = np.string_('1.0')
+        images = mdf.create_group('images')
+        
+        # Add each image to the stack
         for i in range(len(coords_map_stack)):
-            ds_name = f"MDF/images/{i}/image"
-            f.create_dataset(ds_name, data=coords_map_stack[i], dtype=coords_map_stack[i].dtype)
-    logging.info(f"Saved coords_map to {out_path}")
+            img_group = images.create_group(str(i))
+            img_group.create_dataset('image', data=coords_map_stack[i], dtype=coords_map_stack[i].dtype)
+    
+    logging.info(f"Saved EMAN2-compatible coords_map to {out_path}")
+
+def save_cc_maps_stack_eman2(cc_maps_dict, out_path):
+    """
+    Use EMAN2 to save multiple CC maps in a single .hdf stack.
+    Each map is written as one slice.
+    """
+    if not EMAN2_AVAILABLE:
+        logging.error("EMAN2 not available; cannot save cc maps in EMAN2 format.")
+        return
+    
+    # Create parent directories if they don't exist
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    
+    sorted_keys = sorted(cc_maps_dict.keys())
+    for i, tmpl_idx in enumerate(sorted_keys):
+        arr = cc_maps_dict[tmpl_idx]
+        em = EMNumPy.numpy2em(arr)
+        # Write directly using EMAN2's native format
+        em.write_image(out_path, i)
+    logging.info(f"Saved {len(sorted_keys)} CC map(s) to {out_path} using EMAN2")
 
 def save_cc_maps_stack(cc_maps_dict, out_path):
     """
-    Save full CC maps from all templates for a given (filename, image_idx) into an HDF stack.
-    The maps are saved in order (template 0, 1, 2, ...).
+    HDF5-based alternative when EMAN2 is not available.
+    Creates a stack in EMAN2-compatible format.
     """
+    # Create parent directories if they don't exist
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    
     sorted_keys = sorted(cc_maps_dict.keys())
-    stack = np.stack([cc_maps_dict[k] for k in sorted_keys], axis=0)
     with h5py.File(out_path, 'w') as f:
-        for i in range(stack.shape[0]):
-            ds_name = f"MDF/images/{i}/image"
-            f.create_dataset(ds_name, data=stack[i], dtype=stack.dtype)
-    logging.info(f"Saved CC maps stack to {out_path}")
+        # Add attributes needed for EMAN2 compatibility
+        f.attrs['appion_version'] = np.string_('ccpeaks_plot')
+        f.attrs['MDF'] = np.string_('1')
+        
+        # Create group structure
+        mdf = f.create_group('MDF')
+        mdf.attrs['version'] = np.string_('1.0')
+        images = mdf.create_group('images')
+        
+        # Add each image to the stack
+        for i, tmpl_idx in enumerate(sorted_keys):
+            img_group = images.create_group(str(i))
+            img_group.create_dataset('image', data=cc_maps_dict[tmpl_idx], dtype=cc_maps_dict[tmpl_idx].dtype)
+    
+    logging.info(f"Saved {len(sorted_keys)} CC map(s) to {out_path} using HDF5")
+
+#########################
+# compute_auto_diameter
+#########################
+
+def compute_auto_diameter(template, tomo_shape):
+    """
+    Compute a more appropriate diameter for non-spherical objects by considering
+    both the longest and shortest spans of the template.
+    
+    For non-spherical objects, using just the longest span can be too conservative.
+    Using the average of the longest and shortest spans provides a better estimate
+    for the minimum distance between densely packed objects.
+    
+    Parameters:
+        template: 3D volume
+        tomo_shape: Shape of the tomogram
+        
+    Returns:
+        Average of the longest and shortest spans, capped by the tomogram dimension
+    """
+    # Smooth the template to reduce noise
+    smoothed = gaussian_filter(template, sigma=1)
+    
+    # Threshold to identify meaningful density
+    thresh = smoothed.mean() + 2 * smoothed.std()
+    binary = (smoothed >= thresh).astype(np.uint8)
+    
+    # Find coordinates of all non-zero points
+    indices = np.argwhere(binary)
+    if indices.size == 0:
+        return 0
+    
+    # Calculate spans in all dimensions
+    min_indices = indices.min(axis=0)
+    max_indices = indices.max(axis=0)
+    spans = max_indices - min_indices + 1  # Add 1 to include both ends
+    
+    # Get longest and shortest spans
+    longest_span = spans.max()
+    shortest_span = spans.min()
+    
+    # Use average of longest and shortest spans
+    average_span = (longest_span + shortest_span) / 2.0
+    
+    # Cap by the smallest tomogram dimension
+    smallest_tomo_dim = min(tomo_shape)
+    auto_diameter = min(average_span, smallest_tomo_dim)
+    
+    logging.info(f"Auto-diameter calculation: longest_span={longest_span}, shortest_span={shortest_span}, average={average_span:.1f}, final={auto_diameter:.1f}")
+    
+    return auto_diameter
 
 #########################
 # Worker function
@@ -337,139 +618,369 @@ def save_cc_maps_stack(cc_maps_dict, out_path):
 
 def process_image_template(args_tuple):
     """
-    Worker function that:
-      1. Computes the CC map for one (image, template) pair.
-      2. (Optionally) applies a threshold if ccc_thresh_sigma > 0.
-      3. Uses non-maximum suppression to select peaks: it finds the global maximum,
-         then disregards all voxels within --diameter, then repeats.
-      4. Returns the candidate peaks (each as (x, y, z, value)).
-         If save_cc_maps is True, also returns the full CC map.
+    1) Compute CC map,
+    2) Use peak finding method as specified by the user,
+    3) Return final picks + optional CC map if store_ccmap==True.
+    
+    This function supports three peak-finding methods:
+    - "original": Uses the original reliable NMS algorithm
+    - "eman2": Uses EMAN2's masking approach for NMS
+    - "fallback": Uses a pure-Python approach, no EMAN2 required
     """
     try:
         (filename, image_idx, template_idx, image, template,
-         n_peaks, ccc_thresh_sigma, diameter, save_cc_maps) = args_tuple
+         n_peaks_local, cc_thresh, diameter, store_ccmap, method, template_path) = args_tuple
+
+        # 1) Compute normalized cross-correlation map
         cc_map = compute_ncc_map_3d_single(image, template)
-        # If a threshold is specified, zero out values below threshold (so they won't be picked)
-        if ccc_thresh_sigma > 0:
-            thresh = cc_map.mean() + ccc_thresh_sigma * cc_map.std()
-            cc_map = np.where(cc_map >= thresh, cc_map, -np.inf)
-        # Apply greedy non-maximum suppression to extract exactly n_peaks (if n_peaks>0)
-        candidates = non_maximum_suppression(cc_map, n_peaks, diameter)
-        if save_cc_maps:
-            return (filename, image_idx, template_idx, candidates, cc_map)
+
+        # 2) Find peaks using appropriate method
+        if method == "eman2" and EMAN2_AVAILABLE:
+            # Use EMAN2 for peak finding - note that this uses the "outer_radius" parameter 
+            # which is set to radius (half of diameter)
+            radius = diameter / 2.0
+            logging.debug(f"Using EMAN2 method with mask.sharp outer_radius={radius} (diameter={diameter})")
+            local_peaks, cc_map_masked = iterative_nms_eman2(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
+            
+            # Save masked CC map for debugging EMAN2 method
+            if store_ccmap and template_idx == 0:
+                # Return both the original cc_map and masked map for debugging
+                return (filename, image_idx, template_idx, local_peaks, cc_map, cc_map_masked)
+                
+        elif method == "fallback" or (method == "eman2" and not EMAN2_AVAILABLE):
+            # Use fallback method when EMAN2 is requested but not available,
+            # or when fallback is explicitly requested
+            logging.debug(f"Using fallback method (no EMAN2) with diameter={diameter}")
+            local_peaks, cc_map_masked = fallback_iterative_nms(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
         else:
-            return (filename, image_idx, template_idx, candidates)
+            # Default to original NMS algorithm - most reliable for n_peaks
+            logging.debug(f"Using original method with diameter={diameter}")
+            if cc_thresh > 0:
+                thresh = cc_map.mean() + cc_thresh * cc_map.std()
+                cc_map_thresholded = np.where(cc_map >= thresh, cc_map, -np.inf)
+                local_peaks = non_maximum_suppression(cc_map_thresholded, n_peaks_local, diameter)
+            else:
+                local_peaks = non_maximum_suppression(cc_map, n_peaks_local, diameter)
+            cc_map_masked = None  # Not needed for original method
+
+        # Log how many peaks were actually found
+        logging.debug(f"Found {len(local_peaks)} peaks for file {filename}, image {image_idx}, template {template_idx}")
+
+        # Dump peak coordinates for debugging (just for the first template)
+        if template_idx == 0:
+            logging.info(f"PEAK COORDINATES for {filename}, image {image_idx}, template {template_idx}:")
+            for i, (x, y, z, val) in enumerate(local_peaks[:min(10, len(local_peaks))]):  # Show first 10 peaks
+                logging.info(f"  Peak #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}")
+            if len(local_peaks) > 10:
+                logging.info(f"  ... and {len(local_peaks)-10} more peaks")
+
+        # local_peaks are in format (x, y, z, val)
+        if store_ccmap:
+            return (filename, image_idx, template_idx, local_peaks, cc_map)
+        else:
+            return (filename, image_idx, template_idx, local_peaks)
+
     except Exception as e:
-        logging.error("Error processing file {} image {} template {}: {}".format(
-            filename, image_idx, template_idx, str(e)))
+        logging.error(f"Error processing file {filename} image {image_idx} template {template_idx}: {e}")
         logging.error(traceback.format_exc())
         return None
+
+#########################
+# Final aggregator
+#########################
+
+def final_aggregator_greedy(candidate_list, n_peaks, min_distance):
+    """
+    Sort candidates by CC value descending, pick each if
+    it's at least 'min_distance' away from all previously accepted.
+    Returns up to n_peaks.
+
+    candidate_list: list of (x, y, z, val)
+    n_peaks: desired max number of final picks
+    min_distance: float, minimum allowed distance between peaks
+    """
+    # Sort descending by CC value
+    candidate_list.sort(key=lambda x: x[3], reverse=True)
+    accepted = []
+
+    # Use the same consistent NMS approach as before
+    for cand in candidate_list:
+        x, y, z, val = cand
+        too_close = False
+
+        for (ax, ay, az, a_val) in accepted:
+            dist = np.linalg.norm([x - ax, y - ay, z - az])
+            if dist < min_distance:
+                logging.debug(
+                    f"[DEBUG aggregator] EXCLUDING peak "
+                    f"(x={x}, y={y}, z={z}, val={val:.3f}) "
+                    f"because it's too close to "
+                    f"(x={ax}, y={ay}, z={az}, val={a_val:.3f}) "
+                    f"[dist={dist:.3f}, min_distance={min_distance}]"
+                )
+                too_close = True
+                break
+
+        if not too_close:
+            accepted.append(cand)
+            logging.debug(
+                f"[DEBUG aggregator] ACCEPTING peak #{len(accepted)} => "
+                f"(x={x}, y={y}, z={z}, val={val:.3f})"
+            )
+
+        # Stop if we've reached the requested number of peaks
+        if n_peaks > 0 and len(accepted) >= n_peaks:
+            break
+
+    return accepted
+
+#########################
+# Plot distribution
+#########################
+
+def plot_two_distributions(data1, data2, labels, output_path, title="ccs_avgs_plot"):
+    data1 = np.asarray(data1)
+    if data2 is not None and len(data2) > 0:
+        data2 = np.asarray(data2)
+    else:
+        data2 = None
+
+    if data2 is None or len(data2) == 0:
+        # Single distribution
+        fig, ax = plt.subplots(figsize=(8,8))
+        parts = ax.violinplot([data1], positions=[1], showmeans=False, showmedians=False, showextrema=False)
+        ax.scatter(np.full(data1.shape, 1), data1)
+        q1, med, q3 = np.percentile(data1, [25,50,75])
+        mean_val = np.mean(data1)
+        ax.scatter(1, med, marker='s', color='red', zorder=3)
+        ax.scatter(1, mean_val, marker='o', color='white', edgecolor='black', zorder=3)
+        ax.vlines(1, data1.min(), data1.max(), color='black', lw=2)
+        ax.vlines(1, q1, q3, color='black', lw=5)
+        ax.set_xticks([1])
+        ax.set_xticklabels(labels[:1])
+        ax.set_ylabel("CC Peak Values")
+        ax.set_title(f"{title}\nN={len(data1)}")
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close(fig)
+        logging.info(f"Saved single-distribution plot to {output_path}")
+    else:
+        # Two distributions
+        def significance_from_pval(p):
+            if p < 0.001: return "***"
+            elif p < 0.01: return "**"
+            elif p < 0.05: return "*"
+            else: return "ns"
+        def is_normal(dat):
+            if len(dat) < 3:
+                return False
+            stat, p = shapiro(dat)
+            return p > 0.05
+        def calculate_effect_size(dat1, dat2):
+            normal1 = is_normal(dat1)
+            normal2 = is_normal(dat2)
+            if normal1 and normal2:
+                tstat, pval = ttest_ind(dat1, dat2, equal_var=False)
+                mean1, mean2 = np.mean(dat1), np.mean(dat2)
+                var1, var2 = np.var(dat1, ddof=1), np.var(dat2, ddof=1)
+                n1, n2 = len(dat1), len(dat2)
+                pooled_std = np.sqrt(((n1-1)*var1 + (n2-1)*var2) / (n1+n2-2))
+                effect = 0.0 if pooled_std < 1e-12 else (mean1 - mean2) / pooled_std
+                return pval, effect, "Cohen's d"
+            else:
+                stat, pval = mannwhitneyu(dat1, dat2, alternative='two-sided')
+                n1, n2 = len(dat1), len(dat2)
+                effect = 1 - (2*stat)/(n1*n2)  # rank-biserial
+                return pval, effect, "Rank-biserial"
+        pval, effect, method = calculate_effect_size(data1, data2)
+        sig = significance_from_pval(pval)
+        N1, N2 = len(data1), len(data2)
+
+        fig, ax = plt.subplots(figsize=(8,8))
+        parts = ax.violinplot([data1, data2], positions=[1,2], showmeans=False, showmedians=False, showextrema=False)
+        colors = ['#1f77b4', '#ff7f0e']
+        for i, pc in enumerate(parts['bodies']):
+            pc.set_facecolor(colors[i])
+            pc.set_edgecolor('black')
+            pc.set_alpha(0.3)
+
+        # Distribution 1
+        ax.scatter(np.full(data1.shape, 1), data1, edgecolor='k')
+        q1_1, med1, q3_1 = np.percentile(data1, [25,50,75])
+        mean1 = np.mean(data1)
+        ax.scatter(1, med1, marker='s', color='red', zorder=3)
+        ax.scatter(1, mean1, marker='o', color='white', edgecolor='black', zorder=3)
+        ax.vlines(1, data1.min(), data1.max(), color='black', lw=2)
+        ax.vlines(1, q1_1, q3_1, color='black', lw=5)
+
+        # Distribution 2
+        ax.scatter(np.full(data2.shape, 2), data2, edgecolor='k')
+        q1_2, med2, q3_2 = np.percentile(data2, [25,50,75])
+        mean2 = np.mean(data2)
+        ax.scatter(2, med2, marker='s', color='red', zorder=3)
+        ax.scatter(2, mean2, marker='o', color='white', edgecolor='black', zorder=3)
+        ax.vlines(2, data2.min(), data2.max(), color='black', lw=2)
+        ax.vlines(2, q1_2, q3_2, color='black', lw=5)
+
+        ax.set_xticks([1,2])
+        ax.set_xticklabels(labels)
+        ax.set_ylabel("CC Peak Values")
+        ax.set_title(f"{title}\nN1={N1}, N2={N2}\np={pval:.6f} ({sig}), {method}={effect:.4f}")
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close(fig)
+        logging.info(f"Saved two-distribution plot to {output_path}")
 
 #########################
 # Main function
 #########################
 
 def main():
-    """
-    Main routine:
-      - Parse command-line arguments.
-      - Load templates and tomograms.
-      - Check pixel size and intensity.
-      - Compute auto diameter if needed.
-      - Build tasks for each (file, image, template) pair.
-      - Run tasks in parallel with a progress bar.
-      - For each (file, image, template), apply non-maximum suppression and save per-template results.
-      - Combine results across templates for each image and save raw coordinates.
-      - Optionally, build and save coords_map volumes and full CC maps stacks.
-    """
-    parser = argparse.ArgumentParser(
-        description="Compute 3D CC maps and extract peaks using non-maximum suppression."
-    )
+    from collections import defaultdict
+    parser = argparse.ArgumentParser(description="Compute 3D CC maps and extract peaks using non-maximum suppression.")
+
+    # Parameters (alphabetically ordered)
+    parser.add_argument('--cc_thresh', dest='ccc_thresh_sigma', type=float, default=0.0,
+                        help="Threshold for picking peaks (in std above mean). Default=0.0 (no threshold).")
+    parser.add_argument('--coords_map_r', type=int, default=3,
+                        help="Radius of spheres in coordinate maps. Default=3.")
+    parser.add_argument('--data_labels', type=str, default="file1,file2",
+                        help="Comma-separated labels for the datasets. Default='file1,file2'.")
+    parser.add_argument('--diameter', type=float, default=None,
+                        help="Minimum distance in voxels between final peaks. Default=None (auto-computed).")
     parser.add_argument('--input', required=True,
-                        help="Comma-separated input file paths (tomograms).")
+                        help="Comma-separated input file paths (tomograms). Maximum 2 files allowed.")
+    parser.add_argument('--npeaks', type=int, default=None,
+                        help="Number of final peaks to keep per image. Default=None (auto-calculated).")
+    parser.add_argument('--output_dir', default="cc_analysis",
+                        help="Base name for output directory. Default='cc_analysis'.")
+    parser.add_argument('--peak_method', type=str, default="original",
+                        help="Peak finding method (options: 'original', 'eman2', 'fallback'). Default='original'.")
+    parser.add_argument('--save_ccmaps', type=int, default=1,
+                        help="How many CC maps to save per input file. Default=1.")
+    parser.add_argument('--save_coords_map', type=int, default=1,
+                        help="How many coordinate maps to save per input file. Default=1.")
+    parser.add_argument('--save_csv', action='store_true', default=False,
+                        help="Export a CSV summary of all extracted peaks. Default=False.")
     parser.add_argument('--template', required=True,
                         help="Template image file path (can be an HDF stack).")
-    parser.add_argument('--npeaks', type=int, default=34,
-                        help="Number of peaks to keep after NMS. If 0, keep all.")
-    parser.add_argument('--diameter', type=float, default=38,
-                        help="Minimum allowed distance between peaks (in voxels).")
     parser.add_argument('--threads', type=int, default=1,
-                        help="Number of processes to use in parallel.")
-    parser.add_argument('--output_dir', default="cc_analysis",
-                        help="Base name for output directory.")
-    parser.add_argument('--save_coords_map_r', type=int, default=0,
-                        help="If >0, produce an HDF volume marking each final peak with a sphere of radius r.")
-    # Add an alias so that --ccc_thresh can be used; internal name remains ccc_thresh_sigma.
-    parser.add_argument('--cc_thresh', dest='ccc_thresh_sigma', type=float, default=0.0,
-                    help="Threshold for picking peaks: mean + sigma*std. If <=0, no threshold is applied. Default=0.")
-    parser.add_argument('--save_cc_maps', action='store_true', default=False,
-                        help="If set, save full CC maps for each (image, template) pair into a stack (cc_maps.hdf).")
+                        help="Number of processes to use in parallel. Default=1.")
     parser.add_argument('--verbose', type=int, default=2,
-                        help="Verbosity level: 0=ERROR, 1=WARNING, 2=INFO, 3=DEBUG.")
-    
+                        help="Verbosity level (0=ERROR,1=WARNING,2=INFO,3=DEBUG). Default=2.")
+
     args = parser.parse_args()
+
+    # Basic validations
+    if args.save_ccmaps < 1:
+        logging.error("--save_ccmaps must be >= 1.")
+        sys.exit(1)
+        
+    if args.save_coords_map < 1:
+        logging.error("--save_coords_map must be >= 1.")
+        sys.exit(1)
     
-    # Create output directory and setup logging.
+    # Check number of input files
+    input_files = args.input.split(',')
+    if len(input_files) > 2:
+        logging.error("Maximum of 2 input files allowed. Please provide at most two files separated by commas.")
+        sys.exit(1)
+
+    global _VERBOSE
+    _VERBOSE = (args.verbose >= 3)
+
     output_dir = create_output_directory(args.output_dir)
     setup_logging(output_dir, args.verbose)
-    
-    start_time = time.time()
+
+    overall_start = time.time()
     logging.info("Starting processing...")
+
+    # Log EMAN2 availability
+    logging.info(f"EMAN2 is {'available' if EMAN2_AVAILABLE else 'not available'}")
     
-    # Load templates.
-    templates = load_image(args.template)
-    if templates is None:
+    # Load template(s)
+    templates_list = load_image(args.template)
+    if (templates_list is None) or (len(templates_list) == 0):
         logging.error("Could not load template file. Exiting.")
         sys.exit(1)
-    templates = templates.squeeze()
-    if templates.ndim == 3:
-        templates = np.expand_dims(templates, axis=0)
-    n_templates = templates.shape[0]
-    n_digits = len(str(n_templates))
+    templates = [t for t in templates_list]
+    n_templates = len(templates)
     logging.info(f"Loaded {n_templates} template(s) from {args.template}")
+
+    # Enforce that save_ccmaps is not > number of templates
+    if args.save_ccmaps > n_templates:
+        logging.info(f"--save_ccmaps={args.save_ccmaps} but only {n_templates} template(s) present. Reducing to {n_templates}.")
+        args.save_ccmaps = n_templates
+
+    # Load input files and check sizes
+    image_counts = []
+    input_images = []
     
-    # Parse input tomogram files.
-    input_files = args.input.split(',')
+    for file_path in input_files:
+        image_list = load_image(file_path)
+        if (image_list is None) or (len(image_list) == 0):
+            logging.error(f"Could not load tomogram {file_path}. Exiting.")
+            sys.exit(1)
+        image_counts.append(len(image_list))
+        input_images.append(image_list)
     
-    # Get shape of first tomogram (for auto-diameter if needed).
-    first_tomo_file = input_files[0]
-    first_image_stack = load_image(first_tomo_file)
-    if first_image_stack is None:
-        logging.error(f"Could not load first tomogram {first_tomo_file}. Exiting.")
-        sys.exit(1)
-    if first_image_stack.ndim == 3:
-        first_image_stack = np.expand_dims(first_image_stack, axis=0)
-    first_tomo_shape = first_image_stack[0].shape
+    # Get shape from first image of first file
+    first_tomo_shape = input_images[0][0].shape
     
-    # (If diameter <= 0, auto-derive; here we expect a positive diameter from the user.)
-    if args.diameter <= 0:
+    # Cap the save_coords_map to minimum count of images
+    min_images = min(image_counts)
+    if args.save_coords_map > min_images:
+        logging.info(f"--save_coords_map={args.save_coords_map} but minimum image count is {min_images}. Reducing to {min_images}.")
+        args.save_coords_map = min_images
+
+    # Auto diameter if needed
+    if args.diameter is None:
         auto_diameter = compute_auto_diameter(templates[0], first_tomo_shape)
         args.diameter = auto_diameter
         logging.info(f"No diameter provided; using auto-derived diameter: {auto_diameter}")
-    
-    # Build tasks for each (file, image, template) pair.
+
+    process_mem = psutil.Process(os.getpid())
+    logging.info(f"Starting memory usage: {process_mem.memory_info().rss / (1024 * 1024):.2f} MB")
+
     tasks = []
-    shape_by_file_img = {}  # For later use in coords_map.
-    for file_path in input_files:
+    shape_by_file_img = {}
+    for i, file_path in enumerate(input_files):
         filename = os.path.splitext(os.path.basename(file_path))[0]
-        check_apix_and_intensity(file_path, args.template)
-        image_stack = load_image(file_path)
-        if image_stack is None:
-            logging.error(f"File {file_path} could not be loaded. Skipping.")
-            continue
-        if image_stack.ndim == 3:
-            image_stack = np.expand_dims(image_stack, axis=0)
-        n_images = image_stack.shape[0]
-        for img_idx in range(n_images):
-            shape_by_file_img[(filename, img_idx)] = image_stack[img_idx].shape
-            for tmpl_idx in range(n_templates):
+        check_apix(file_path, args.template)  # Use the renamed function (no intensity check)
+        
+        # Use the already loaded images to avoid loading them again
+        image_list = input_images[i]
+        
+        # Only process up to save_coords_map images for each file
+        for img_idx, image_3d in enumerate(image_list[:args.save_coords_map]):
+            shape_by_file_img[(filename, img_idx)] = image_3d.shape
+
+            # Calculate local_npeaks (how many peaks to find per template)
+            if args.npeaks is None:
+                diam_int = int(args.diameter)
+                n_possible = (image_3d.shape[0] // diam_int) * (image_3d.shape[1] // diam_int) * (image_3d.shape[2] // diam_int)
+                local_npeaks = n_possible
+            else:
+                local_npeaks = args.npeaks
+
+            # For each template
+            for tmpl_idx, template_data in enumerate(templates):
+                store_map = (tmpl_idx < args.save_ccmaps)  # only store CC map for first N templates
                 tasks.append((
-                    filename, img_idx, tmpl_idx,
-                    image_stack[img_idx], templates[tmpl_idx],
-                    args.npeaks, args.ccc_thresh_sigma, args.diameter, args.save_cc_maps
+                    filename,
+                    img_idx,
+                    tmpl_idx,
+                    image_3d,
+                    template_data,
+                    local_npeaks,         # local picks
+                    args.ccc_thresh_sigma,
+                    args.diameter,
+                    store_map,
+                    args.peak_method,
+                    args.template
                 ))
-    
-    # Run tasks in parallel with tqdm progress bar.
+
+    # Process all tasks
     partial_results = []
     with ProcessPoolExecutor(max_workers=args.threads) as executor:
         futures = [executor.submit(process_image_template, t) for t in tasks]
@@ -477,776 +988,213 @@ def main():
             res = fut.result()
             if res is not None:
                 partial_results.append(res)
-    
-    # Organize worker results by (filename, image_idx, template_idx).
+
     partial_peaks = defaultdict(list)
-    cc_maps = {}  # Only used if save_cc_maps is True.
+    cc_maps = {}
+
+    # Collect local picks
     for res in partial_results:
-        if args.save_cc_maps:
-            filename, image_idx, template_idx, peaks, cc_map = res
-            cc_maps[(filename, image_idx, template_idx)] = cc_map
-        else:
-            filename, image_idx, template_idx, peaks = res
-        partial_peaks[(filename, image_idx, template_idx)] = peaks
-        logging.debug(f"File {filename}, image {image_idx}, template {template_idx} returned {len(peaks)} peaks after NMS.")
-    
-    # 1) For each (file, image, template), save per-template results.
-    for key, peaks in partial_peaks.items():
-        filename, image_idx, template_idx = key
-        filtered = peaks  # Our NMS algorithm already returns mutually exclusive peaks.
-        template_str = str(template_idx).zfill(n_digits)
-        peak_coords = np.array([[p[0], p[1], p[2]] for p in filtered], dtype=int)
-        peak_values = np.array([p[3] for p in filtered], dtype=float)
-        save_peak_data(output_dir, filename, template_str, image_idx, peak_coords, peak_values, n_templates)
-        if peak_coords.size > 0:
-            plot_3d_peak_coordinates(output_dir, filename, template_str, image_idx, peak_coords)
-        partial_peaks[key] = filtered  # Update (not strictly needed)
-    
-    # 2) Combine peaks across templates for each (file, image) and save raw coordinates.
+        if len(res) == 6:  # EMAN2 debug format with both original and masked CC maps
+            filename, image_idx, tmpl_idx, local_peaks, cc_map_raw, cc_map_masked = res
+            cc_maps[(filename, image_idx, tmpl_idx)] = (cc_map_raw, cc_map_masked)  # Store as tuple
+            logging.info(f"Saved both original and masked CC maps for debugging (template {tmpl_idx})")
+        elif len(res) == 5:  # With regular CC map
+            filename, image_idx, tmpl_idx, local_peaks, cc_map_raw = res
+            cc_maps[(filename, image_idx, tmpl_idx)] = cc_map_raw
+        else:  # Without CC map
+            filename, image_idx, tmpl_idx, local_peaks = res
+
+        partial_peaks[(filename, image_idx, tmpl_idx)] = local_peaks
+        logging.debug(f"[PER-TEMPLATE] {filename}, img={image_idx}, tmpl={tmpl_idx} => {len(local_peaks)} local picks")
+
+    # Combine local picks (all templates) for each (filename, image_idx)
     combined_peaks_by_file_img = defaultdict(list)
-    for (filename, image_idx, template_idx), peaks in partial_peaks.items():
+    for (filename, image_idx, tmpl_idx), peaks in partial_peaks.items():
         combined_peaks_by_file_img[(filename, image_idx)].extend(peaks)
-    for (filename, image_idx), peaks in combined_peaks_by_file_img.items():
-        final_peaks = non_maximum_suppression_from_list(peaks, args.npeaks, args.diameter)
-        raw_coords_dir = os.path.join(output_dir, "raw_coordinates")
-        img_str = str(image_idx).zfill(2)
-        out_txt = os.path.join(raw_coords_dir, f"coords_{filename}_{img_str}.txt")
+
+    # Now do a final aggregator that picks exactly args.npeaks (if possible) out of the combined list
+    cc_peaks_dir = os.path.join(output_dir, "cc_peaks")
+    os.makedirs(cc_peaks_dir, exist_ok=True)
+
+    aggregated_ccs = defaultdict(list)
+    aggregated_avgs = defaultdict(list)
+    final_peaks_by_img = {}
+
+    # If user didn't specify n_peaks, we do the same auto-calc used for local
+    aggregator_npeaks = args.npeaks if args.npeaks else 0
+    
+    # When using EMAN2 method, use half-diameter for consistency
+    # since we already corrected EMAN2 to use radius = diameter/2
+    if args.peak_method == "eman2" and EMAN2_AVAILABLE:
+        # For EMAN2, use half-diameter to be consistent with our EMAN2 fix
+        logging.info(f"Final aggregator: picking up to {aggregator_npeaks} peaks from combined candidates, using method={args.peak_method} with diameter={args.diameter}...")
+    else:
+        # For other methods, use the regular diameter value
+        logging.info(f"Final aggregator: picking up to {aggregator_npeaks} peaks from combined candidates, using method={args.peak_method} with diameter={args.diameter}...")
+
+    for (filename, image_idx), all_candidates in combined_peaks_by_file_img.items():
+        logging.info(f"[AGGREGATOR PRE] {filename}, image={image_idx} => {len(all_candidates)} total candidates from all templates")
+
+        # Dump the first 10 candidate peaks for debugging
+        logging.info(f"CANDIDATE PEAKS before aggregation for {filename}, image {image_idx}:")
+        for i, (x, y, z, val) in enumerate(sorted(all_candidates, key=lambda p: p[3], reverse=True)[:min(10, len(all_candidates))]):
+            logging.info(f"  Candidate #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}")
+        
+        # When using EMAN2 method, the mask.sharp is using radius (diameter/2) 
+        # so for consistency, we need to use the same minimum distance in the final aggregator
+        if args.peak_method == "eman2" and EMAN2_AVAILABLE:
+            # For EMAN2, we need to use diameter/2 because that's what the EMAN2 masking uses
+            min_distance = args.diameter / 2.0
+            logging.info(f"Using aggregator with EMAN2-compatible distance={min_distance} (half of diameter {args.diameter})")
+        else:
+            # For other methods, use the original diameter value
+            min_distance = args.diameter
+            logging.info(f"Using aggregator with original distance={min_distance}")
+            
+        final_peaks = final_aggregator_greedy(all_candidates, aggregator_npeaks, min_distance)
+
+        # Dump the final peaks for debugging
+        logging.info(f"FINAL PEAKS after aggregation for {filename}, image {image_idx}:")
+        for i, (x, y, z, val) in enumerate(final_peaks):
+            logging.info(f"  Final Peak #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}")
+
+        logging.info(f"[AGGREGATOR POST] {filename}, image={image_idx} => {len(final_peaks)} final peaks")
+
+        final_peaks_by_img[(filename, image_idx)] = final_peaks
+        # Write out to a text file
+        out_txt = os.path.join(cc_peaks_dir, f"ccs_{filename}_{str(image_idx+1).zfill(2)}.txt")
         with open(out_txt, 'w') as f:
             for (x, y, z, val) in final_peaks:
-                f.write(f"{int(x):6d} {int(y):6d} {int(z):6d}\n")
-        logging.info(f"Saved raw coords to {out_txt}")
-        combined_peaks_by_file_img[(filename, image_idx)] = final_peaks
-    
-    # 3) If requested, build and save coords_map volumes for each file.
-    if args.save_coords_map_r > 0:
-        file_to_num_images = defaultdict(int)
-        for file_path in input_files:
-            fname = os.path.splitext(os.path.basename(file_path))[0]
-            image_stack = load_image(file_path)
-            if image_stack is None:
-                logging.error(f"Error re-loading file {file_path} for coords_map; skipping.")
-                continue
-            if image_stack.ndim == 3:
-                image_stack = np.expand_dims(image_stack, axis=0)
-            file_to_num_images[fname] = image_stack.shape[0]
-        for file_path in input_files:
-            fname = os.path.splitext(os.path.basename(file_path))[0]
-            if fname not in file_to_num_images:
-                continue
-            n_images = file_to_num_images[fname]
-            coords_map_stack = []
-            for i in range(n_images):
-                shape_3d = shape_by_file_img[(fname, i)]
-                coords_map_stack.append(np.zeros(shape_3d, dtype=np.uint8))
-            for i in range(n_images):
-                final_peaks = combined_peaks_by_file_img[(fname, i)]
-                for (x, y, z, val) in final_peaks:
-                    place_sphere(coords_map_stack[i], (int(x), int(y), int(z)), args.save_coords_map_r)
-            out_hdf = os.path.join(output_dir, f"{fname}_coords_map.hdf")
-            save_coords_map_as_hdf(coords_map_stack, out_hdf)
-    # 4) If requested, save full CC maps for each (file, image) into a stack.
-    if args.save_cc_maps:
+                f.write(f"{x}\t{y}\t{z}\t{val:.6f}\n")
+        logging.info(f"Saved aggregated CC peaks to {out_txt}")
+
+        # Accumulate for distribution
+        aggregated_ccs[filename].extend(final_peaks)
+        avg_val = np.mean([p[3] for p in final_peaks]) if final_peaks else np.nan
+        aggregated_avgs[filename].append((image_idx, avg_val))
+
+    # Write global aggregated results
+    for filename, peaks in aggregated_ccs.items():
+        out_file = os.path.join(output_dir, f"ccs_{filename}.txt")
+        with open(out_file, 'w') as f:
+            for (x, y, z, val) in peaks:
+                f.write(f"{x}\t{y}\t{z}\t{val:.6f}\n")
+        logging.info(f"Saved aggregated CC peaks for file {filename} to {out_file}")
+
+    # Write average CC
+    for filename, avg_list in aggregated_avgs.items():
+        out_file = os.path.join(output_dir, f"ccs_{filename}_avgs.txt")
+        with open(out_file, 'w') as f:
+            f.write("Image_Index\tAverage_CC\n")
+            for (img_idx, av) in sorted(avg_list, key=lambda x: x[0]):
+                f.write(f"{img_idx}\t{av:.6f}\n")
+        logging.info(f"Saved average CC values for file {filename} to {out_file}")
+
+    # Plot distributions
+    if len(input_files) == 2:
+        data_labels = args.data_labels.split(',')
+        file1 = os.path.splitext(os.path.basename(input_files[0]))[0]
+        file2 = os.path.splitext(os.path.basename(input_files[1]))[0]
+        avg_data1 = [a for (_, a) in aggregated_avgs[file1]]
+        avg_data2 = [a for (_, a) in aggregated_avgs[file2]]
+        out_avg_plot = os.path.join(output_dir, "ccs_avgs_plot.png")
+        plot_two_distributions(avg_data1, avg_data2, data_labels, out_avg_plot, title="ccs_avgs_plot")
+
+        dist_data1 = [p[3] for p in aggregated_ccs[file1]]
+        dist_data2 = [p[3] for p in aggregated_ccs[file2]]
+        out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
+        plot_two_distributions(dist_data1, dist_data2, data_labels, out_dist_plot, title="ccs_distribution_plot")
+    else:
+        file1 = os.path.splitext(os.path.basename(input_files[0]))[0]
+        data_label = args.data_labels.split(',')[0]
+        avg_data = [a for (_, a) in aggregated_avgs[file1]]
+        out_avg_plot = os.path.join(output_dir, "ccs_avgs_plot.png")
+        plot_two_distributions(avg_data, None, [data_label], out_avg_plot, title="ccs_avgs_plot")
+
+        dist_data = [p[3] for p in aggregated_ccs[file1]]
+        out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
+        plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title="ccs_distribution_plot")
+
+    # Save CC maps
+    if args.save_ccmaps > 0:
         cc_maps_by_file_img = defaultdict(dict)
-        for (filename, image_idx, template_idx), cc_map in cc_maps.items():
-            cc_maps_by_file_img[(filename, image_idx)][template_idx] = cc_map
+        cc_maps_masked_by_file_img = defaultdict(dict)
+        
+        # Process cc maps and masked cc maps (if available)
+        for key, value in cc_maps.items():
+            if isinstance(value, tuple) and len(value) == 2:
+                # We have both original and masked maps
+                filename, image_idx, tmpl_idx = key
+                cc_map_raw, cc_map_masked = value
+                cc_maps_by_file_img[(filename, image_idx)][tmpl_idx] = cc_map_raw
+                cc_maps_masked_by_file_img[(filename, image_idx)][tmpl_idx] = cc_map_masked
+            else:
+                # We just have the original map
+                filename, image_idx, tmpl_idx = key
+                cc_maps_by_file_img[(filename, image_idx)][tmpl_idx] = value
+        
+        # Save original CC maps
         for (filename, image_idx), maps_dict in cc_maps_by_file_img.items():
-            out_hdf = os.path.join(output_dir, f"{filename}_cc_maps.hdf")
-            save_cc_maps_stack(maps_dict, out_hdf)
-    
-    elapsed = time.time() - start_time
-    logging.info(f"Processing finished successfully in {elapsed:.2f} seconds.")
+            out_hdf = os.path.join(output_dir, f"{filename}_img{image_idx}_cc_maps.hdf")
+            if EMAN2_AVAILABLE:
+                save_cc_maps_stack_eman2(maps_dict, out_hdf)
+            else:
+                save_cc_maps_stack(maps_dict, out_hdf)
+                
+        # Save masked CC maps for debugging (if available)
+        for (filename, image_idx), maps_dict in cc_maps_masked_by_file_img.items():
+            out_hdf = os.path.join(output_dir, f"{filename}_img{image_idx}_cc_maps_masked.hdf")
+            if EMAN2_AVAILABLE:
+                save_cc_maps_stack_eman2(maps_dict, out_hdf)
+                logging.info(f"Saved masked CC maps for debugging to {out_hdf}")
+            else:
+                save_cc_maps_stack(maps_dict, out_hdf)
+                logging.info(f"Saved masked CC maps for debugging to {out_hdf}")
 
-def non_maximum_suppression_from_list(candidate_list, n_peaks, diameter):
-    """
-    Given a list of candidate peaks (each as (x,y,z,value)), perform greedy non-maximum suppression.
-    This function is used to combine candidates from multiple templates.
-    Returns a list of peaks (x,y,z,value) that are at least 'diameter' apart, up to n_peaks.
-    If n_peaks==0, return all.
-    """
-    # Sort candidates by value descending
-    candidate_list.sort(key=lambda x: x[3], reverse=True)
-    accepted = []
-    for cand in candidate_list:
-        x, y, z, val = cand
-        too_close = False
-        for (ax, ay, az, aval) in accepted:
-            if np.linalg.norm(np.array([x, y, z]) - np.array([ax, ay, az])) < diameter:
-                too_close = True
-                break
-        if not too_close:
-            accepted.append(cand)
-        if n_peaks > 0 and len(accepted) >= n_peaks:
-            break
-    return accepted
-
-if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        logging.error("Fatal error: " + str(e))
-        logging.error(traceback.format_exc())
-        sys.exit(1)
-
-
-
-
-
-'''
-#!/usr/bin/env python
-#
-# Author: Jesus Galaz-Montoya 2025; last modification: Mar/21/2025
-#
-# Modifications:
-#  1. Added logging and a log file that records the full command for reproducibility.
-#  2. Renamed 'coordinate_files' to 'coordinate_plots' and saved PNGs with compression.
-#  3. Added support for multiple templates as an HDF stack.
-#  4. Added --diameter filtering to ensure peaks are not too close.
-#  5. Parallelized the NCC computation over image-template pairs using --threads.
-#  6. Fixed dtype mismatch in saving peaks by writing rows as text manually.
-#  7. **NEW**: If --diameter <= 0, automatically derive a diameter from the template’s
-#     bounding box of meaningful density, clamped to the shortest dimension of the first
-#     tomogram and the template.
-
-import argparse
-import os
-import sys
-import numpy as np
-import mrcfile
-import h5py
-import matplotlib.pyplot as plt
-from scipy.signal import correlate
-from scipy.stats import ttest_ind, mannwhitneyu, shapiro
-import logging
-import time
-import traceback
-from mpl_toolkits.mplot3d import Axes3D
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import defaultdict
-from scipy.ndimage import gaussian_filter
-
-def create_output_directory(base_dir):
-    """Create and return a numbered output directory with needed subfolders."""
-    i = 0
-    while os.path.exists(f"{base_dir}_{i:02}"):
-        i += 1
-    output_dir = f"{base_dir}_{i:02}"
-    os.makedirs(output_dir)
-    os.makedirs(os.path.join(output_dir, "correlation_files"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "coordinate_plots"), exist_ok=True)
-    return output_dir
-
-def setup_logging(output_dir):
-    """Set up logging to a file and console."""
-    log_file = os.path.join(output_dir, "run.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    logging.info("Command: " + " ".join(sys.argv))
-    return log_file
-
-def load_image(file_path):
-    """Loads a 3D image or a stack of 3D images from an HDF5 or MRC file."""
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext in ['.hdf', '.h5']:
-        with h5py.File(file_path, 'r') as file:
-            # Assumes structure MDF/images/<i>/image
-            dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
-            image_stack = np.array([file[ds][:] for ds in dataset_paths])
-    elif ext == '.mrc':
-        with mrcfile.open(file_path, permissive=True) as mrc:
-            image_stack = mrc.data
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
-    
-    return image_stack
-
-def adjust_template(template, target_shape):
-    """
-    Adjusts the template to match the target shape (tomogram dimensions)
-    by centering and clipping or padding as necessary.
-    """
-    t_shape = template.shape
-    new_template = np.zeros(target_shape, dtype=template.dtype)
-    slices_target = []
-    slices_template = []
-    for i, (t_dim, tgt_dim) in enumerate(zip(t_shape, target_shape)):
-        if t_dim <= tgt_dim:
-            start_tgt = (tgt_dim - t_dim) // 2
-            slices_target.append(slice(start_tgt, start_tgt + t_dim))
-            slices_template.append(slice(0, t_dim))
-        else:
-            start_tpl = (t_dim - tgt_dim) // 2
-            slices_target.append(slice(0, tgt_dim))
-            slices_template.append(slice(start_tpl, start_tpl + tgt_dim))
-    new_template[tuple(slices_target)] = template[tuple(slices_template)]
-    return new_template
-
-def compute_ncc_map_3d_single(image, template):
-    """
-    Computes the 3D normalized cross-correlation map for one image and one template.
-    If the template shape does not match the image shape, adjust it accordingly.
-    """
-    if image.shape != template.shape:
-        template = adjust_template(template, image.shape)
-    ncc = correlate(image, template, mode='same', method='fft')
-    ncc = (ncc - np.mean(ncc)) / np.std(ncc)
-    return ncc
-
-def extract_ncc_peaks_with_diameter(ncc_map, npeaks, diameter):
-    """
-    Extracts up to npeaks from the NCC map ensuring that no two accepted peaks
-    are closer than 'diameter'. Peaks are taken in descending order of NCC value.
-    """
-    sorted_indices = np.argsort(ncc_map.ravel())[::-1]
-    accepted_coords = []
-    accepted_values = []
-    for idx in sorted_indices:
-        coord = np.array(np.unravel_index(idx, ncc_map.shape))
-        value = ncc_map.ravel()[idx]
-        if diameter > 0 and accepted_coords:
-            dists = np.linalg.norm(np.array(accepted_coords) - coord, axis=1)
-            if np.any(dists < diameter):
-                continue
-        accepted_coords.append(coord)
-        accepted_values.append(value)
-        if len(accepted_coords) >= npeaks:
-            break
-    return np.array(accepted_values), np.array(accepted_coords)
-
-def compute_auto_diameter(template, tomo_shape):
-    """
-    1) Low-pass filter (Gaussian blur, sigma=2).
-    2) Threshold at mean + 2*std to form a mask of “meaningful” density.
-    3) Find bounding box of that mask, define “longest span” = max dimension.
-    4) Clamp so it cannot exceed the shortest dimension of the tomogram
-       or the shortest dimension of the template.
-    """
-    blurred = gaussian_filter(template, sigma=2.0)
-    mean_val = blurred.mean()
-    std_val = blurred.std()
-    threshold = mean_val + 2.0 * std_val
-
-    mask = (blurred >= threshold)
-    if not np.any(mask):
-        logging.warning("Auto diameter: no voxels above threshold, returning diameter=0.")
-        return 0.0
-
-    coords = np.argwhere(mask)
-    x_min, y_min, z_min = coords.min(axis=0)
-    x_max, y_max, z_max = coords.max(axis=0)
-
-    # bounding box size
-    dx = x_max - x_min + 1
-    dy = y_max - y_min + 1
-    dz = z_max - z_min + 1
-    diameter = max(dx, dy, dz)
-
-    # clamp to the smaller of: min dimension of tomo or min dimension of template
-    diameter = min(diameter, min(tomo_shape))
-    diameter = min(diameter, min(template.shape))
-
-    return diameter
-
-def save_peak_data(output_dir, filename, template_str, image_idx, peak_coords, peak_values, total_templates):
-    """
-    Saves the peak coordinates and NCC values to a formatted text file.
-    Columns: Template, X, Y, Z, NCC_Value
-    """
-    image_str = str(image_idx).zfill(3)
-    out_file = os.path.join(output_dir, 'correlation_files', f'ccc_{filename}_T{template_str}_I{image_str}.txt')
-    
-    # We'll define column widths so things line up under the header
-    header = f"{'Template':<10} {'X':>5} {'Y':>5} {'Z':>5} {'NCC_Value':>10}"
-    
-    with open(out_file, 'w') as f:
-        f.write(header + "\n")
-        for i in range(len(peak_values)):
-            x, y, z = map(int, peak_coords[i])
-            val = float(peak_values[i])
-            f.write(f"{template_str:<10} {x:5d} {y:5d} {z:5d} {val:10.6f}\n")
-    
-    logging.info(f"Saved NCC peaks to {out_file}")
-
-def plot_3d_peak_coordinates(output_dir, filename, template_str, image_idx, peak_coords):
-    """Plots the NCC peak coordinates in 3D and saves the plot as a compressed PNG."""
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(peak_coords[:, 0], peak_coords[:, 1], peak_coords[:, 2], c='red', marker='o')
-    ax.set_xlabel("X Coordinate")
-    ax.set_ylabel("Y Coordinate")
-    ax.set_zlabel("Z Coordinate")
-    ax.set_title("Top NCC Peak Locations")
-    image_str = str(image_idx).zfill(3)
-    out_png = os.path.join(output_dir, 'coordinate_plots', f'ccc_{filename}_T{template_str}_I{image_str}.png')
-    plt.savefig(out_png, dpi=150, compress_level=9)
-    plt.close()
-    logging.info(f"Saved 3D peak plot to {out_png}")
-
-def is_normal(data, alpha=0.05):
-    """Check if the data is normally distributed using the Shapiro-Wilk test."""
-    _, p_value = shapiro(data)
-    return p_value > alpha
-
-def calculate_effect_size(data1, data2):
-    """Calculates Cohen's d or Rank-Biserial correlation depending on normality."""
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    if normal1 and normal2:
-        stat, p_value = ttest_ind(data1, data2)
-        effect_size = (np.mean(data1) - np.mean(data2)) / np.sqrt((np.var(data1) + np.var(data2)) / 2)
-        method = "Cohen's d"
-    else:
-        stat, p_value = mannwhitneyu(data1, data2)
-        effect_size = 1 - (2 * stat) / (len(data1) * len(data2))
-        method = "Rank-biserial correlation"
-    return p_value, effect_size, method
-
-def plot_violin(data1, data2, filenames, output_dir):
-    """
-    Generates a violin plot comparing NCC peak distributions with relevant statistics.
-    Displays total number of points (N) for each distribution above its violin.
-    """
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    fig, ax = plt.subplots(figsize=(8, 8))
-    
-    # Plot the two distributions as a violin plot
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-
-    # Customize violin colors
-    colors = ['blue', 'orange']
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-    
-    # Style mean/median lines
-    if 'cmeans' in parts:
-        parts['cmeans'].set_linestyle('--')
-        parts['cmeans'].set_linewidth(2)
-        parts['cmeans'].set_color('red')
-    if 'cmedians' in parts:
-        parts['cmedians'].set_linestyle('-')
-        parts['cmedians'].set_linewidth(2)
-        parts['cmedians'].set_color('black')
-
-    # X-axis labels
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(filenames, rotation=30, ha='right')
-    ax.set_ylabel("NCC Peak Values")
-    
-    # Main title with stats
-    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-    
-    # Annotate each violin with the total number of points
-    data_list = [data1, data2]
-    for i, data in enumerate(data_list):
-        x_loc = i + 1
-        y_max = np.max(data)
-        y_min = np.min(data)
-        # Add a small offset so the text sits above the top of the violin
-        offset = 0.05 * (y_max - y_min) if (y_max - y_min) != 0 else 0.1
-        y_pos = y_max + offset
-        ax.text(x_loc, y_pos, f"N={len(data)}", ha='center', va='bottom', fontsize=10, color='black')
-
-    plt.tight_layout()
-    out_png = os.path.join(output_dir, "ncc_violin_plot.png")
-    plt.savefig(out_png, dpi=150, compress_level=9)
-    plt.close()
-    logging.info(f"Saved violin plot to {out_png}")
-
-
-def process_image_template(args_tuple):
-    """
-    Worker function to process one image-template pair.
-    Returns: (filename, image_idx, template_idx, peak_coords, peak_values)
-    """
-    try:
-        (filename, image_idx, template_idx, image, template, npeaks, diameter) = args_tuple
-        ncc = compute_ncc_map_3d_single(image, template)
-        peak_values, peak_coords = extract_ncc_peaks_with_diameter(ncc, npeaks, diameter)
-        return (filename, image_idx, template_idx, peak_coords, peak_values)
-    except Exception as e:
-        logging.error("Error processing file {} image {} template {}: {}".format(
-            filename, image_idx, template_idx, str(e)))
-        logging.error(traceback.format_exc())
-        return None
-
-def main():
-    parser = argparse.ArgumentParser(description="Compute 3D NCC maps and compare peak distributions.")
-    parser.add_argument('--input', required=True, help="Comma-separated input file paths.")
-    parser.add_argument('--template', required=True, help="Template image file path (can be an HDF stack of templates).")
-    parser.add_argument('--npeaks', type=int, default=10, help="Number of top peaks to extract per image-template pair.")
-    parser.add_argument('--diameter', type=float, default=0,
-                        help="Minimum allowed distance between peaks (in pixels). "
-                             "If <=0, derive automatically from template’s bounding box.")
-    parser.add_argument('--threads', type=int, default=1, help="Number of threads (processes) to use for parallel processing.")
-    parser.add_argument('--output_dir', default="ncc_analysis", help="Output directory base name.")
-    args = parser.parse_args()
-    
-    output_dir = create_output_directory(args.output_dir)
-    setup_logging(output_dir)
-    
-    start_time = time.time()
-    logging.info("Starting processing...")
-    
-    # Load template(s)
-    templates = load_image(args.template).squeeze()
-    if templates.ndim == 3:
-        templates = np.expand_dims(templates, axis=0)
-    n_templates = templates.shape[0]
-    n_digits = len(str(n_templates))
-    logging.info(f"Loaded {n_templates} template(s) from {args.template}")
-    
-    # Split and load the first tomogram to get shape for diameter clamping
-    input_files = args.input.split(',')
-    first_tomo_file = input_files[0]
-    first_image_stack = load_image(first_tomo_file)
-    if first_image_stack.ndim == 3:
-        first_image_stack = np.expand_dims(first_image_stack, axis=0)
-    first_tomo_shape = first_image_stack[0].shape
-    
-    # If user didn't provide a positive diameter, compute automatically from the first template & first tomogram
-    if args.diameter <= 0:
-        auto_diameter = compute_auto_diameter(templates[0], first_tomo_shape)
-        args.diameter = auto_diameter
-        logging.info(f"No diameter provided; using auto-derived diameter: {auto_diameter}")
-
-    peak_values_by_file = defaultdict(list)
-    tasks = []
-
-    # Now proceed to create tasks for *all* input files
-    for file_path in input_files:
-        filename = os.path.splitext(os.path.basename(file_path))[0]
-        try:
-            image_stack = load_image(file_path)
-        except Exception as e:
-            logging.error(f"Error loading image file {file_path}: {e}")
+    # Always build coordinate maps from final peaks (using coords_map_r parameter)
+    coord_maps_by_file = defaultdict(list)
+    for (filename, image_idx), final_peaks in final_peaks_by_img.items():
+        # Only include up to save_coords_map images per file
+        if image_idx >= args.save_coords_map:
             continue
-        if image_stack.ndim == 3:
-            image_stack = np.expand_dims(image_stack, axis=0)
-        n_images = image_stack.shape[0]
-        for img_idx in range(n_images):
-            for tmpl_idx in range(n_templates):
-                tasks.append((filename, img_idx, tmpl_idx,
-                              image_stack[img_idx], templates[tmpl_idx],
-                              args.npeaks, args.diameter))
+            
+        shape = shape_by_file_img[(filename, image_idx)]
+        coords_map = np.zeros(shape, dtype=np.uint8)
+        for (x, y, z, val) in final_peaks:
+            place_sphere(coords_map, (x, y, z), args.coords_map_r)  # Use the new parameter
+        coord_maps_by_file[filename].append(coords_map)
+        logging.info(f"Created coordinate map for file {filename}, image {image_idx} with {len(final_peaks)} peaks")
 
-    results = []
-    with ProcessPoolExecutor(max_workers=args.threads) as executor:
-        future_to_task = {executor.submit(process_image_template, task): task for task in tasks}
-        for future in as_completed(future_to_task):
-            result = future.result()
-            if result is not None:
-                results.append(result)
-    
-    for (filename, image_idx, template_idx, peak_coords, peak_values) in results:
-        template_str = str(template_idx).zfill(n_digits)
-        save_peak_data(output_dir, filename, template_str, image_idx, peak_coords, peak_values, n_templates)
-        plot_3d_peak_coordinates(output_dir, filename, template_str, image_idx, peak_coords)
-        peak_values_by_file[filename].extend(peak_values.tolist())
-    
-    # If exactly two input files, produce a violin plot for quick comparison
-    if len(peak_values_by_file) == 2:
-        file_keys = list(peak_values_by_file.keys())
-        data1 = np.array(peak_values_by_file[file_keys[0]])
-        data2 = np.array(peak_values_by_file[file_keys[1]])
-        plot_violin(data1, data2, file_keys, output_dir)
-    
-    elapsed = time.time() - start_time
-    logging.info(f"Processing finished successfully in {elapsed:.2f} seconds.")
+    # Save coordinate maps
+    for filename, maps_list in coord_maps_by_file.items():
+        # Ensure we only save up to save_coords_map maps per file
+        maps_to_save = maps_list[:args.save_coords_map]
+        out_map = os.path.join(output_dir, f"{filename}_coords_map.hdf")
+        save_coords_map_as_hdf(maps_to_save, out_map)
+        logging.info(f"Saved {len(maps_to_save)} coordinate map(s) for file {filename} to {out_map}")
 
-if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        logging.error("Fatal error: " + str(e))
-        logging.error(traceback.format_exc())
-        sys.exit(1)
-'''
+    # Optionally, save CSV
+    if args.save_csv:
+        csv_out = os.path.join(output_dir, "aggregated_cc_peaks.csv")
+        with open(csv_out, 'w', newline='') as csvfile:
+            fieldnames = ["Input_File", "Image_Index", "X", "Y", "Z", "CC_Value"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for (filename, image_idx), final_peaks in final_peaks_by_img.items():
+                for (x, y, z, val) in final_peaks:
+                    writer.writerow({
+                        "Input_File": filename,
+                        "Image_Index": image_idx,
+                        "X": x,
+                        "Y": y,
+                        "Z": z,
+                        "CC_Value": f"{val:.6f}"
+                    })
+        logging.info(f"Saved aggregated CSV summary of all extracted peaks to {csv_out}")
 
-
-
-
-'''PRESUMABLY WORKS MARCH 20 2025
-#!/usr/bin/env python
-#
-# Author: Jesus Galaz-Montoya 2025; last modification: Mar/13/2025
-#
-# Modifications:
-#  1. Added logging and command-line logging to a log file.
-#  2. Renamed 'coordinate_files' to 'coordinate_plots' and saved PNGs with compression.
-#  3. Added support for multiple templates as an HDF stack.
-#  4. Added --diameter filtering to ensure peaks are not too close.
-#  5. Parallelized the NCC computation over image-template pairs using --threads.
-#
-import argparse
-import os
-import sys
-import numpy as np
-import mrcfile
-import h5py
-import matplotlib.pyplot as plt
-from scipy.signal import correlate
-from scipy.stats import ttest_ind, mannwhitneyu, shapiro
-import logging
-import time
-import traceback
-from mpl_toolkits.mplot3d import Axes3D
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import defaultdict
-
-def create_output_directory(base_dir):
-    """Create and return a numbered output directory with needed subfolders."""
-    i = 0
-    while os.path.exists(f"{base_dir}_{i:02}"):
-        i += 1
-    output_dir = f"{base_dir}_{i:02}"
-    os.makedirs(output_dir)
-    os.makedirs(os.path.join(output_dir, "correlation_files"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "coordinate_plots"), exist_ok=True)
-    return output_dir
-
-def setup_logging(output_dir):
-    """Set up logging to a file and console."""
-    log_file = os.path.join(output_dir, "run.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    # Log the full command used to run the script.
-    logging.info("Command: " + " ".join(sys.argv))
-    return log_file
-
-def load_image(file_path):
-    """Loads a 3D image or a stack of 3D images from an HDF5 or MRC file."""
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext in ['.hdf', '.h5']:
-        with h5py.File(file_path, 'r') as file:
-            # Assumes structure MDF/images/<i>/image
-            dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
-            image_stack = np.array([file[ds][:] for ds in dataset_paths])
-    elif ext == '.mrc':
-        with mrcfile.open(file_path, permissive=True) as mrc:
-            image_stack = mrc.data
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
-    
-    return image_stack
-
-def compute_ncc_map_3d_single(image, template):
-    """Computes the 3D normalized cross-correlation map for one image and one template."""
-    if image.shape != template.shape:
-        raise ValueError(f"Dimension mismatch: Image shape {image.shape}, Template shape {template.shape}")
-    ncc = correlate(image, template, mode='same', method='fft')
-    ncc = (ncc - np.mean(ncc)) / np.std(ncc)
-    return ncc
-
-def extract_ncc_peaks_with_diameter(ncc_map, npeaks, diameter):
-    """
-    Extracts up to npeaks from the NCC map ensuring that no two accepted peaks
-    are closer than 'diameter'. Peaks are taken in descending order of NCC value.
-    """
-    sorted_indices = np.argsort(ncc_map.ravel())[::-1]
-    accepted_coords = []
-    accepted_values = []
-    for idx in sorted_indices:
-        coord = np.array(np.unravel_index(idx, ncc_map.shape))
-        value = ncc_map.ravel()[idx]
-        # If diameter filtering is enabled, check distances to already accepted peaks
-        if diameter > 0 and accepted_coords:
-            dists = np.linalg.norm(np.array(accepted_coords) - coord, axis=1)
-            if np.any(dists < diameter):
-                continue
-        accepted_coords.append(coord)
-        accepted_values.append(value)
-        if len(accepted_coords) >= npeaks:
-            break
-    return np.array(accepted_values), np.array(accepted_coords)
-
-def save_peak_data(output_dir, filename, template_str, image_idx, peak_coords, peak_values, total_templates):
-    """
-    Saves the peak coordinates and NCC values to a formatted text file.
-    The output file will have columns: Template, X, Y, Z, NCC_Value.
-    """
-    # File name using the base filename, template and image indices
-    image_str = str(image_idx).zfill(3)
-    out_file = os.path.join(output_dir, 'correlation_files', f'ccc_{filename}_T{template_str}_I{image_str}.txt')
-    header = "Template  X  Y  Z  NCC_Value"
-    # Include the template number (already formatted with zfill)
-    data = np.column_stack((np.full(peak_coords.shape[0], template_str), peak_coords, peak_values))
-    fmt = '%s %5d %5d %5d %10.6f'
-    np.savetxt(out_file, data, fmt=fmt, header=header)
-    logging.info(f"Saved NCC peaks to {out_file}")
-
-def plot_3d_peak_coordinates(output_dir, filename, template_str, image_idx, peak_coords):
-    """Plots the NCC peak coordinates in 3D and saves the plot as a compressed PNG."""
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(peak_coords[:, 0], peak_coords[:, 1], peak_coords[:, 2], c='red', marker='o')
-    ax.set_xlabel("X Coordinate")
-    ax.set_ylabel("Y Coordinate")
-    ax.set_zlabel("Z Coordinate")
-    ax.set_title("Top NCC Peak Locations")
-    image_str = str(image_idx).zfill(3)
-    out_png = os.path.join(output_dir, 'coordinate_plots', f'ccc_{filename}_T{template_str}_I{image_str}.png')
-    # Save with compression settings (adjust dpi and compress_level as needed)
-    plt.savefig(out_png, dpi=150, compress_level=9)
-    plt.close()
-    logging.info(f"Saved 3D peak plot to {out_png}")
-
-def is_normal(data, alpha=0.05):
-    """Check if the data is normally distributed using the Shapiro-Wilk test."""
-    _, p_value = shapiro(data)
-    return p_value > alpha
-
-def calculate_effect_size(data1, data2):
-    """Calculates Cohen's d or Rank-Biserial correlation depending on normality."""
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    if normal1 and normal2:
-        stat, p_value = ttest_ind(data1, data2)
-        effect_size = (np.mean(data1) - np.mean(data2)) / np.sqrt((np.var(data1) + np.var(data2)) / 2)
-        method = "Cohen's d"
-    else:
-        stat, p_value = mannwhitneyu(data1, data2)
-        effect_size = 1 - (2 * stat) / (len(data1) * len(data2))
-        method = "Rank-biserial correlation"
-    return p_value, effect_size, method
-
-def plot_violin(data1, data2, filenames, output_dir):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics."""
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    fig, ax = plt.subplots(figsize=(8, 8))
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-
-    # Customize colors
-    colors = ['blue', 'orange']
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-    if 'cmeans' in parts:
-        parts['cmeans'].set_linestyle('--')
-        parts['cmeans'].set_linewidth(2)
-        parts['cmeans'].set_color('red')
-    if 'cmedians' in parts:
-        parts['cmedians'].set_linestyle('-')
-        parts['cmedians'].set_linewidth(2)
-        parts['cmedians'].set_color('black')
-        
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(filenames, rotation=30, ha='right')
-    ax.set_ylabel("NCC Peak Values")
-    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-    plt.tight_layout()
-    out_png = os.path.join(output_dir, "ncc_violin_plot.png")
-    plt.savefig(out_png, dpi=150, compress_level=9)
-    plt.close()
-    logging.info(f"Saved violin plot to {out_png}")
-
-def process_image_template(args_tuple):
-    """
-    Worker function to process one image-template pair.
-    Expects a tuple:
-      (filename, image_idx, template_idx, image, template, npeaks, diameter)
-    Returns: (filename, image_idx, template_idx, peak_coords, peak_values)
-    """
-    try:
-        (filename, image_idx, template_idx, image, template, npeaks, diameter) = args_tuple
-        # Compute NCC map
-        ncc = compute_ncc_map_3d_single(image, template)
-        # Extract peaks with diameter filtering
-        peak_values, peak_coords = extract_ncc_peaks_with_diameter(ncc, npeaks, diameter)
-        return (filename, image_idx, template_idx, peak_coords, peak_values)
-    except Exception as e:
-        logging.error("Error processing file {} image {} template {}: {}".format(filename, image_idx, template_idx, str(e)))
-        logging.error(traceback.format_exc())
-        return None
-
-def main():
-    parser = argparse.ArgumentParser(description="Compute 3D NCC maps and compare peak distributions.")
-    parser.add_argument('--input', required=True, help="Comma-separated input file paths.")
-    parser.add_argument('--template', required=True, help="Template image file path (can be an HDF stack of templates).")
-    parser.add_argument('--npeaks', type=int, default=10, help="Number of top peaks to extract per image-template pair.")
-    parser.add_argument('--diameter', type=float, default=0, help="Minimum allowed distance between peaks (in pixels); 0 means no filtering.")
-    parser.add_argument('--threads', type=int, default=1, help="Number of threads (processes) to use for parallel processing.")
-    parser.add_argument('--output_dir', default="ncc_analysis", help="Output directory base name.")
-    args = parser.parse_args()
-    
-    # Create output directory and setup logging.
-    output_dir = create_output_directory(args.output_dir)
-    setup_logging(output_dir)
-    
-    start_time = time.time()
-    logging.info("Starting processing...")
-    
-    # Load template(s)
-    templates = load_image(args.template).squeeze()
-    # Ensure templates is 4D: (n_templates, x, y, z)
-    if templates.ndim == 3:
-        templates = np.expand_dims(templates, axis=0)
-    n_templates = templates.shape[0]
-    n_digits = len(str(n_templates))
-    logging.info(f"Loaded {n_templates} template(s) from {args.template}")
-    
-    input_files = args.input.split(',')
-    # Dictionary to accumulate peak values for violin plot (if exactly two input files)
-    peak_values_by_file = defaultdict(list)
-    
-    # Prepare a list of tasks (each one is a tuple for an image-template pair)
-    tasks = []
-    for file_path in input_files:
-        filename = os.path.splitext(os.path.basename(file_path))[0]
-        try:
-            image_stack = load_image(file_path)
-        except Exception as e:
-            logging.error(f"Error loading image file {file_path}: {e}")
-            continue
-        # If image_stack is 3D then assume one image
-        if image_stack.ndim == 3:
-            image_stack = np.expand_dims(image_stack, axis=0)
-        n_images = image_stack.shape[0]
-        for img_idx in range(n_images):
-            for tmpl_idx in range(n_templates):
-                tasks.append((filename, img_idx, tmpl_idx, image_stack[img_idx], templates[tmpl_idx],
-                              args.npeaks, args.diameter))
-    
-    # Process tasks in parallel using ProcessPoolExecutor
-    results = []
-    with ProcessPoolExecutor(max_workers=args.threads) as executor:
-        future_to_task = {executor.submit(process_image_template, task): task for task in tasks}
-        for future in as_completed(future_to_task):
-            result = future.result()
-            if result is not None:
-                results.append(result)
-    
-    # Process the results: Save peak data and generate plots.
-    for (filename, image_idx, template_idx, peak_coords, peak_values) in results:
-        # Format the template number string with zfill.
-        template_str = str(template_idx).zfill(n_digits)
-        save_peak_data(output_dir, filename, template_str, image_idx, peak_coords, peak_values, n_templates)
-        plot_3d_peak_coordinates(output_dir, filename, template_str, image_idx, peak_coords)
-        # Accumulate peak values for violin plot (grouped by input file)
-        peak_values_by_file[filename].extend(peak_values.tolist())
-    
-    # Optionally, if exactly two input files were processed, generate a violin plot.
-    if len(peak_values_by_file) == 2:
-        file_keys = list(peak_values_by_file.keys())
-        data1 = np.array(peak_values_by_file[file_keys[0]])
-        data2 = np.array(peak_values_by_file[file_keys[1]])
-        plot_violin(data1, data2, file_keys, output_dir)
-    
-    elapsed = time.time() - start_time
-    logging.info(f"Processing finished successfully in {elapsed:.2f} seconds.")
+    overall_end = time.time()
+    logging.info(f"Total processing time: {overall_end - overall_start:.2f} seconds")
+    logging.info(f"Final memory usage: {process_mem.memory_info().rss / (1024 * 1024):.2f} MB")
 
 if __name__ == '__main__':
     try:
@@ -1255,730 +1203,3 @@ if __name__ == '__main__':
         logging.error("Fatal error: " + str(e))
         logging.error(traceback.format_exc())
         sys.exit(1)
-'''
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-'''
-WORKS IN FEBRUARY 2025
-
-#!/usr/bin/env python
-#
-# Author: Jesus Galaz-Montoya 2025; last modification: Jan/30/2025
-
-import argparse
-import os
-import numpy as np
-import mrcfile
-import h5py
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.signal import correlate
-from scipy.stats import ttest_ind, mannwhitneyu, shapiro, normaltest
-import logging
-import time
-import traceback
-from mpl_toolkits.mplot3d import Axes3D
-
-def create_output_directory(base_dir):
-    """Create and return a numbered output directory."""
-    i = 0
-    while os.path.exists(f"{base_dir}_{i:02}"):
-        i += 1
-    output_dir = f"{base_dir}_{i:02}"
-    os.makedirs(output_dir)
-    os.makedirs(os.path.join(output_dir, "correlation_files"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "coordinate_files"), exist_ok=True)
-    return output_dir
-
-def load_image(file_path):
-    """Loads a 3D image or a stack of 3D images from an HDF5 or MRC file."""
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext in ['.hdf', '.h5']:
-        with h5py.File(file_path, 'r') as file:
-            dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
-            image_stack = np.array([file[ds][:] for ds in dataset_paths])
-    elif ext == '.mrc':
-        with mrcfile.open(file_path, permissive=True) as mrc:
-            image_stack = mrc.data
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
-    
-    return image_stack
-
-def compute_ncc_map_3d(image_stack, template):
-    """Computes the 3D normalized cross-correlation map for each image in the stack."""
-    ncc_maps = []
-    i=0
-    for image in image_stack:
-        print(f"\nfor image {i}, Image shape {image.shape}, Template shape {template.shape}")
-        if image.shape != template.shape:
-            raise ValueError(f"Mismatch in dimensions: Image shape {image.shape}, Template shape {template.shape}")
-        
-        ncc = correlate(image, template, mode='same', method='fft')
-        ncc = (ncc - np.mean(ncc)) / np.std(ncc)
-        ncc_maps.append(ncc)
-        i+=1
-
-    return np.array(ncc_maps)
-
-def extract_ncc_peaks(ncc_map, npeaks):
-    """Extracts the top NCC peaks and their coordinates from the 3D NCC map."""
-    flat_indices = np.argsort(ncc_map.ravel())[::-1][:npeaks]
-    peak_values = ncc_map.ravel()[flat_indices]
-    peak_coords = np.column_stack(np.unravel_index(flat_indices, ncc_map.shape))
-    return peak_values, peak_coords
-
-def save_peak_data(output_dir, peak_coords, peak_values, filename, index):
-    """Saves the peak coordinates and values to a formatted text file."""
-    output_txt = os.path.join(output_dir, 'correlation_files', f'ccc_{filename}_' + str(index).zfill(3)+ '.txt')
-    np.savetxt(output_txt, np.column_stack((peak_coords, peak_values)), fmt='%5d %5d %5d %10.6f', header='X Y Z NCC_Value')
-
-def plot_3d_peak_coordinates(output_dir, peak_coords, filename, index):
-    """Plots the NCC peak coordinates in 3D."""
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(peak_coords[:, 0], peak_coords[:, 1], peak_coords[:, 2], c='red', marker='o')
-    ax.set_xlabel("X Coordinate")
-    ax.set_ylabel("Y Coordinate")
-    ax.set_zlabel("Z Coordinate")
-    ax.set_title("Top NCC Peak Locations")
-    output_png = os.path.join(output_dir, 'coordinate_files', f'ccc_{filename}_' + str(index).zfill(3)+ '.png')
-    plt.savefig(output_png)
-    plt.close()
-
-def is_normal(data, alpha=0.05):
-    """Check if the data is normally distributed using the Shapiro-Wilk test."""
-    _, p_value_shapiro = shapiro(data)
-    return p_value_shapiro > alpha
-
-def calculate_effect_size(data1, data2):
-    """Calculates Cohen's d or Rank-Biserial correlation depending on normality."""
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    if normal1 and normal2:
-        stat, p_value = ttest_ind(data1, data2)
-        effect_size = (np.mean(data1) - np.mean(data2)) / np.sqrt((np.var(data1) + np.var(data2)) / 2)
-        method = "Cohen's d"
-    else:
-        stat, p_value = mannwhitneyu(data1, data2)
-        effect_size = 1 - (2 * stat) / (len(data1) * len(data2))
-        method = "Rank-biserial correlation"
-    return p_value, effect_size, method
-
-def plot_violin(data1, data2, filenames, output_dir):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics, including number of peaks (N)."""
-    
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-
-    # Customizing violin colors
-    colors = ['blue', 'orange']
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-
-    # Ensure mean and median lines are clearly distinguishable
-    if 'cmeans' in parts:
-        parts['cmeans'].set_linestyle('--')  # Dashed style for means
-        parts['cmeans'].set_linewidth(2)
-        parts['cmeans'].set_color('red')
-    
-    if 'cmedians' in parts:
-        parts['cmedians'].set_linestyle('-')  # Solid style for medians
-        parts['cmedians'].set_linewidth(2)
-        parts['cmedians'].set_color('black')
-
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(filenames, rotation=30, ha='right')  # Prevent overlapping labels
-    ax.set_ylabel("NCC Peak Values")
-    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-
-    # Adjust statistics box placement dynamically to avoid overlapping the title
-    max_y = max(max(data1), max(data2))
-    min_y = min(min(data1), min(data2))
-    y_offset = (max_y - min_y) * 0.2  # Increase offset for better spacing
-
-    for i, data in enumerate([data1, data2]):
-        mean_val, median_val = np.mean(data), np.median(data)
-        ax.text(i + 1, max_y + y_offset, 
-                f"N={len(data)}\nGaussian: {is_normal(data)}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
-                ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "ncc_violin_plot.png"))
-    plt.close()
-
-    
-
-def main():
-    parser = argparse.ArgumentParser(description="Compute 3D NCC maps and compare peak distributions.")
-    parser.add_argument('--input', required=True, help="Comma-separated input file paths.")
-    parser.add_argument('--template', required=True, help="Template image file path.")
-    parser.add_argument('--npeaks', type=int, default=10, help="Number of top peaks to extract per image in a stack.")
-    parser.add_argument('--output_dir', default="ncc_analysis", help="Output directory base name.")
-    args = parser.parse_args()
-    
-    output_dir = create_output_directory(args.output_dir)
-    input_files = args.input.split(',')
-    
-    #template = load_image(args.template)
-    template = load_image(args.template).squeeze()
-    
-    peak_values_list = []
-    filenames = []
-    
-    index=0
-    for file_path in input_files:
-        filename = os.path.splitext(os.path.basename(file_path))[0]
-        image_stack = load_image(file_path)
-
-        # Compute NCC for each image in the stack
-        ncc_maps = compute_ncc_map_3d(image_stack, template)
-        
-        all_peak_values = []
-        all_peak_coords = []
-        
-        for ncc_map in ncc_maps:
-            peak_values, peak_coords = extract_ncc_peaks(ncc_map, args.npeaks)
-            all_peak_values.extend(peak_values)
-            all_peak_coords.extend(peak_coords)
-
-            save_peak_data(output_dir, peak_coords, peak_values, filename, index)
-            plot_3d_peak_coordinates(output_dir, peak_coords, filename, index)
-
-            index+=1
-
-        peak_values_list.append(all_peak_values)
-        filenames.append(filename)
-
-    if len(peak_values_list) == 2:
-        plot_violin(*peak_values_list, filenames, output_dir)
-
-if __name__ == '__main__':
-    main()
-
-'''
-
-
-
-
-
-
-
-
-
-
-'''
-INITIAL VERSION
-
-def plot_violin(data1, data2, filenames, output_dir):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics, including number of peaks (N)."""
-    
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-
-    fig, ax = plt.subplots(figsize=(6, 8))
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-
-    # Customizing mean and median appearance
-   
-    if 'cmeans' in parts:
-        parts['cmeans'].set_linestyle('--')  # Dashed style for means
-        parts['cmeans'].set_linewidth(2)
-        parts['cmeans'].set_color('red')
-    
-    if 'cmedians' in parts:
-        parts['cmedians'].set_linestyle('-')  # Solid style for medians
-        parts['cmedians'].set_linewidth(2)
-        parts['cmedians'].set_color('black')
-
-    colors = ['blue', 'orange']
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(filenames)
-    ax.set_ylabel("NCC Peak Values")
-    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-
-    # Adjust text placement to prevent overlap
-    text_y_offset = max(max(data1), max(data2)) * 0.05
-    for i, data in enumerate([data1, data2]):
-        mean_val, median_val = np.mean(data), np.median(data)
-        ax.text(i + 1, max(data) + text_y_offset, 
-                f"N={len(data)}\nGaussian: {is_normal(data)}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
-                ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "ncc_violin_plot.png"))
-    plt.close()
-    '''
-
-'''
-SINGLE IMAGE PROCESSING PER INPUT
-
-#!/usr/bin/env python
-#
-# Author: Jesus Galaz-Montoya 2025; last modification: Jan/30/2025
-
-import argparse
-import os
-import numpy as np
-import mrcfile
-import h5py
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.signal import correlate
-from scipy.stats import ttest_ind, mannwhitneyu, shapiro, normaltest
-import logging
-import time
-import traceback
-from mpl_toolkits.mplot3d import Axes3D
-
-def create_output_directory(base_dir):
-    """Create and return a numbered output directory."""
-    i = 0
-    while os.path.exists(f"{base_dir}_{i:02}"):
-        i += 1
-    output_dir = f"{base_dir}_{i:02}"
-    os.makedirs(output_dir)
-    return output_dir
-
-def load_image(file_path):
-    """Loads a 3D image from an HDF5 or MRC file."""
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext in ['.hdf', '.h5']:
-        with h5py.File(file_path, 'r') as file:
-            dataset_path = "MDF/images/0/image"
-            if dataset_path not in file:
-                raise KeyError(f"Dataset path '{dataset_path}' not found in HDF5 file.")
-            print(f"Using dataset: {dataset_path}")
-            image_stack = file[dataset_path][:]
-    elif ext == '.mrc':
-        with mrcfile.open(file_path, permissive=True) as mrc:
-            image_stack = mrc.data
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
-    
-    return image_stack
-
-def compute_ncc_map_3d(image, template):
-    """Computes the 3D normalized cross-correlation map without redundant normalization."""
-    
-    # Normalize inputs
-    #image = (image - np.mean(image)) / np.std(image)
-    #template = (template - np.mean(template)) / np.std(template)
-    
-    # Compute NCC
-    ncc = correlate(image, template, mode='same', method='fft')
-    ncc = (ncc - np.mean(ncc)) / np.std(ncc)
-    
-    return ncc
-
-def extract_ncc_peaks(ncc_map, npeaks):
-    """Extracts the top NCC peaks and their coordinates from the 3D NCC map."""
-    flat_indices = np.argsort(ncc_map.ravel())[::-1][:npeaks]
-    peak_values = ncc_map.ravel()[flat_indices]
-    peak_coords = np.column_stack(np.unravel_index(flat_indices, ncc_map.shape))
-    return peak_values, peak_coords
-
-def save_peak_data(output_dir, filename, peak_coords, peak_values):
-    """Saves the peak coordinates and values to a formatted text file."""
-    output_txt = os.path.join(output_dir, f'ccc_{filename}.txt')
-    np.savetxt(output_txt, np.column_stack((peak_coords, peak_values)), fmt='%5d %5d %5d %10.6f', header='X Y Z NCC_Value')
-
-def plot_3d_peak_coordinates(peak_coords, filename):
-    """Plots the NCC peak coordinates in 3D."""
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(peak_coords[:, 0], peak_coords[:, 1], peak_coords[:, 2], c='red', marker='o')
-    ax.set_xlabel("X Coordinate")
-    ax.set_ylabel("Y Coordinate")
-    ax.set_zlabel("Z Coordinate")
-    ax.set_title("Top NCC Peak Locations")
-    plt.savefig(filename)
-    plt.close()
-
-def plot_violin(data1, data2, filenames, output_dir, tag=''):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics."""
-    
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    
-    fig, ax = plt.subplots(figsize=(6, 8))
-    parts = ax.violinplot([data1, data2], showmeans=True, showmedians=True)
-    colors = ['blue', 'orange']
-    
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-    
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(filenames)
-    ax.set_ylabel("NCC Peak Values")
-    ax.set_title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-    
-    max_y = max(max(data1), max(data2))
-    y_offset = (max_y - min(min(data1), min(data2))) * 0.15  
-    
-    for i, data in enumerate([data1, data2]):
-        mean_val, median_val = np.mean(data), np.median(data)
-        ax.text(i + 1, max_y + y_offset, 
-                f"N={len(data)}\nGaussian: {normal1 if i == 0 else normal2}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
-                ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-    
-    plt.tight_layout()
-    vp_filename = "ncc_violin_plot.png" if tag == '' else "ncc_violin_plot_norm.png"
-    plt.savefig(os.path.join(output_dir, vp_filename))
-    plt.close()
-
-def calculate_effect_size(data1, data2):
-    """Calculates Cohen's d or Rank-Biserial correlation depending on normality, with dataset normalization."""
-    
-    # Normalize both datasets (z-score normalization)
-    #data1 = (data1 - np.mean(data1)) / np.std(data1)
-    #data2 = (data2 - np.mean(data2)) / np.std(data2)
-    
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    
-    if normal1 and normal2:
-        stat, p_value = ttest_ind(data1, data2)
-        effect_size = (np.mean(data1) - np.mean(data2)) / np.sqrt((np.var(data1) + np.var(data2)) / 2)
-        method = "Cohen's d"
-    else:
-        stat, p_value = mannwhitneyu(data1, data2)
-        effect_size = 1 - (2 * stat) / (len(data1) * len(data2))
-        method = "Rank-biserial correlation"
-    
-    return p_value, effect_size, method
-
-
-def is_normal(data, alpha=0.05):
-    """Check if the data is normally distributed using the Shapiro-Wilk test."""
-    _, p_value_shapiro = shapiro(data)
-    #_, p_value_normal = normaltest(data)
-
-    #print(f"\np_value_shapiro={p_value_shapiro})")
-    #print(f"\np_value_normal={p_value_normal})")
-    
-    #return (p_value_shapiro+p_value_normal)/2 > alpha
-    return p_value_shapiro > alpha
-
-def main():
-    parser = argparse.ArgumentParser(description="Compute 3D NCC maps and compare peak distributions.")
-    parser.add_argument('--input', required=True, help="Comma-separated input file paths.")
-    parser.add_argument('--template', required=True, help="Template image file path.")
-    parser.add_argument('--npeaks', type=int, default=10, help="Number of top peaks to extract.")
-    parser.add_argument('--output_dir', default="ncc_analysis", help="Output directory base name.")
-    args = parser.parse_args()
-    
-    output_dir = create_output_directory(args.output_dir)
-    input_files = args.input.split(',')
-    
-    template = load_image(args.template)
-    
-    peak_values_list = []
-    filenames = []
-    
-    for file_path in input_files:
-        filename = os.path.splitext(os.path.basename(file_path))[0]
-        image_stack = load_image(file_path)
-        ncc_map = compute_ncc_map_3d(image_stack, template)
-        
-        peak_values, peak_coords = extract_ncc_peaks(ncc_map, args.npeaks)
-        save_peak_data(output_dir, filename, peak_coords, peak_values)
-        plot_3d_peak_coordinates(peak_coords, os.path.join(output_dir, f'ccc_{filename}_peaks.png'))
-        peak_values_list.append(peak_values)
-        filenames.append(filename)
-    
-    if len(peak_values_list) == 2:
-        plot_violin(*peak_values_list, filenames, output_dir)
-
-if __name__ == '__main__':
-    main()
-
-'''
-
-
-
-
-
-
-
-
-'''
-def plot_violin(data1, data2, filenames, output_dir, tag=''):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics."""
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    
-    plt.figure(figsize=(6, 8))
-    parts = plt.violinplot([data1, data2], showmeans=True, showmedians=True)
-    colors = ['blue', 'orange']
-    
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-    
-    plt.xticks([1, 2], filenames)
-    plt.ylabel("NCC Peak Values")
-    plt.title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-    
-    for i, data in enumerate([data1, data2]):
-        mean_val, median_val = np.mean(data), np.median(data)
-        plt.text(i + 1, max(data) + (0.1 * max(data)), 
-                 f"N={len(data)}\nGaussian: {normal1 if i == 0 else normal2}\nMean: {mean_val:.2f}\nMedian: {median_val:.2f}",
-                 ha='center', bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3'))
-    
-    plt.tight_layout()
-    vp_filename = "ncc_violin_plot.png" if tag == '' else "ncc_violin_plot_norm.png"
-    plt.savefig(os.path.join(output_dir, vp_filename))
-    plt.close()
-'''
-
-
-
-'''
-def compute_ncc_map_3d(image, template):
-    """Computes the 3D normalized cross-correlation map with correct normalization."""
-    
-    image = (image - np.mean(image)) / np.std(image)
-    template = (template - np.mean(template)) / np.std(template)
-    
-    ncc = correlate(image, template, mode='same', method='fft')
-    
-    ncc_norm = (ncc - np.mean(ncc)) / np.std(ncc)
-
-    return ncc, ncc_norm
-'''
-
-
-'''
-def calculate_effect_size(data1, data2):
-    """Calculates Cohen's d or Rank-Biserial correlation depending on normality."""
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    if normal1 and normal2:
-        stat, p_value = ttest_ind(data1, data2)
-        effect_size = (np.mean(data1) - np.mean(data2)) / np.sqrt((np.var(data1) + np.var(data2)) / 2)
-        method = "Cohen's d"
-    else:
-        stat, p_value = mannwhitneyu(data1, data2)
-        effect_size = 1 - (2 * stat) / (len(data1) * len(data2))
-        method = "Rank-biserial correlation"
-    return p_value, effect_size, method
-    '''
-
-'''
-#!/usr/bin/env python
-#
-# Author: Jesus Galaz-Montoya 2025; last modification: Jan/29/2025
-
-import argparse
-import os
-import numpy as np
-import mrcfile
-import h5py
-import matplotlib.pyplot as plt
-from scipy.signal import correlate
-from scipy.stats import ttest_ind, mannwhitneyu, shapiro
-import logging
-import time
-import traceback
-from mpl_toolkits.mplot3d import Axes3D
-
-def create_output_directory(base_dir):
-    """Create and return a numbered output directory."""
-    i = 0
-    while os.path.exists(f"{base_dir}_{i:02}"):
-        i += 1
-    output_dir = f"{base_dir}_{i:02}"
-    os.makedirs(output_dir)
-    return output_dir
-
-def load_image(file_path):
-    """Loads a 3D image from an HDF5 or MRC file."""
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext in ['.hdf', '.h5']:
-        with h5py.File(file_path, 'r') as file:
-            dataset_path = "MDF/images/0/image"
-            if dataset_path not in file:
-                raise KeyError(f"Dataset path '{dataset_path}' not found in HDF5 file.")
-            print(f"Using dataset: {dataset_path}")
-            image_stack = file[dataset_path][:]
-    elif ext == '.mrc':
-        with mrcfile.open(file_path, permissive=True) as mrc:
-            image_stack = mrc.data
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
-    
-    return image_stack
-
-def compute_ncc_map_3d(image, template):
-    """Computes the 3D normalized cross-correlation map with correct normalization."""
-    
-    image = (image - np.mean(image)) / np.std(image)
-    template = (template - np.mean(template)) / np.std(template)
-    
-    ncc = correlate(image, template, mode='same', method='fft')
-    
-    #ncc /= (np.std(image) * np.std(template))
-    ncc_norm = (ncc - np.mean(ncc)) / np.std(ncc)
-
-    return ncc, ncc_norm
-
-def extract_ncc_peaks(ncc_map, npeaks):
-    """Extracts the top NCC peaks and their coordinates from the 3D NCC map."""
-    flat_indices = np.argsort(ncc_map.ravel())[::-1][:npeaks]
-    peak_values = ncc_map.ravel()[flat_indices]
-    peak_coords = np.column_stack(np.unravel_index(flat_indices, ncc_map.shape))
-    return peak_values, peak_coords
-
-def save_peak_data(output_dir, filename, peak_coords, peak_values):
-    """Saves the peak coordinates and values to a formatted text file."""
-    output_txt = os.path.join(output_dir, f'ccc_{filename}.txt')
-    np.savetxt(output_txt, np.column_stack((peak_coords, peak_values)), fmt='%5d %5d %5d %10.6f', header='X Y Z NCC_Value')
-
-def plot_3d_peak_coordinates(peak_coords, filename):
-    """Plots the NCC peak coordinates in 3D."""
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(peak_coords[:, 0], peak_coords[:, 1], peak_coords[:, 2], c='red', marker='o')
-    ax.set_xlabel("X Coordinate")
-    ax.set_ylabel("Y Coordinate")
-    ax.set_zlabel("Z Coordinate")
-    ax.set_title("Top NCC Peak Locations")
-    plt.savefig(filename)
-    plt.close()
-
-def plot_violin(data1, data2, filenames, output_dir, tag=''):
-    """Generates a violin plot comparing NCC peak distributions with relevant statistics."""
-    p_value, effect_size, method = calculate_effect_size(data1, data2)
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    
-    plt.figure(figsize=(6, 8))
-    parts = plt.violinplot([data1, data2], showmedians=True)
-    colors = ['blue', 'orange']
-    
-    for i, pc in enumerate(parts['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.6)
-    
-    plt.xticks([1, 2], filenames)
-    plt.ylabel("NCC Peak Values")
-    plt.title(f"Comparison of NCC Peaks\nMethod: {method}, p={p_value:.6f}, Effect Size: {effect_size:.6f}")
-    
-    for i, data in enumerate([data1, data2]):
-        plt.text(i + 1, max(data) + 0.02, f"N={len(data)}\nGaussian: {normal1 if i == 0 else normal2}", ha='center')
-    
-    plt.tight_layout()
-    vp_filename = "ncc_violin_plot.png"
-    print(f"\n\n\ntag={tag}")
-    if tag == 'norm':
-        vp_filename = "ncc_violin_plot_norm.png"
-    plt.savefig(os.path.join(output_dir, vp_filename))
-    plt.close()
-
-def calculate_effect_size(data1, data2):
-    """Calculates Cohen's d or Rank-Biserial correlation depending on normality."""
-    normal1, normal2 = is_normal(data1), is_normal(data2)
-    if normal1 and normal2:
-        stat, p_value = ttest_ind(data1, data2)
-        effect_size = (np.mean(data1) - np.mean(data2)) / np.sqrt((np.var(data1) + np.var(data2)) / 2)
-        method = "Cohen's d"
-    else:
-        stat, p_value = mannwhitneyu(data1, data2)
-        effect_size = 1 - (2 * stat) / (len(data1) * len(data2))
-        method = "Rank-biserial correlation"
-    return p_value, effect_size, method
-
-def is_normal(data, alpha=0.05):
-    """Check if the data is normally distributed using the Shapiro-Wilk test."""
-    _, p_value = shapiro(data)
-    return p_value > alpha
-
-def main():
-    parser = argparse.ArgumentParser(description="Compute 3D NCC maps and compare peak distributions.")
-    parser.add_argument('--input', required=True, help="Comma-separated input file paths.")
-    parser.add_argument('--template', required=True, help="Template image file path.")
-    parser.add_argument('--npeaks', type=int, default=10, help="Number of top peaks to extract.")
-    parser.add_argument('--output_dir', default="ncc_analysis", help="Output directory base name.")
-    args = parser.parse_args()
-    
-    output_dir = create_output_directory(args.output_dir)
-    input_files = args.input.split(',')
-    
-    template = load_image(args.template)
-    
-    peak_values_list = []
-    peak_values_norm_list = []
-    filenames = []
-    filenames_norm = []
-    
-    for file_path in input_files:
-        filename = os.path.splitext(os.path.basename(file_path))[0]
-        image_stack = load_image(file_path)
-        ncc_map, ncc_norm_map = compute_ncc_map_3d(image_stack, template)
-        
-        peak_values, peak_coords = extract_ncc_peaks(ncc_map, args.npeaks)
-        save_peak_data(output_dir, filename, peak_coords, peak_values)
-        
-        peak_values_norm, peak_coords_norm = extract_ncc_peaks(ncc_norm_map, args.npeaks)
-        filename_norm = filename + '_norm'
-        save_peak_data(output_dir, filename_norm, peak_coords_norm, peak_values_norm)
-        
-        plot_3d_peak_coordinates(peak_coords, os.path.join(output_dir, f'ccc_{filename}_peaks.png'))
-        peak_values_list.append(peak_values)
-        peak_values_norm_list.append(peak_values_norm)
-        filenames.append(filename)
-        filenames_norm.append(filename_norm)
-    
-    if len(peak_values_list) == 2:
-        plot_violin(*peak_values_list, filenames, output_dir)
-    if len(peak_values_norm_list) == 2:
-        print(f'\nplotting violin plot for filenames_norm={filenames_norm}')
-        plot_violin(*peak_values_norm_list, filenames_norm, output_dir,'norm')
-
-if __name__ == '__main__':
-    main()
-'''
-
-'''
-def compute_ncc_map_3d(image, template):
-    """Computes the 3D normalized cross-correlation map."""
-    image = (image - np.mean(image)) / np.std(image)
-    template = (template - np.mean(template)) / np.std(template)
-    
-    ncc = correlate(image, template, mode='same', method='fft')
-    
-    # Normalize the entire NCC map to have mean 0 and standard deviation 1
-    ncc = (ncc - np.mean(ncc)) / np.std(ncc)
-    
-    return ncc
-
-'''
-
