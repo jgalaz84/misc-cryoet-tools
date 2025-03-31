@@ -869,7 +869,21 @@ def plot_two_distributions(data1, data2, labels, output_path, title="CC Distribu
 
 def main():
     from collections import defaultdict
-    parser = argparse.ArgumentParser(description="Compute 3D CC maps and extract peaks using non-maximum suppression.")
+    parser = argparse.ArgumentParser(
+        description="Compute 3D cross-correlation maps between tomograms and templates, then extract and analyze peaks.\n"
+        "Process all images in input files but saves coordinate maps only for the first --save_coords_map images to save space.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with single tomogram and single template:
+  python ccpeaks_plot_claude.py --input tomogram.hdf --template template.hdf --npeaks 20 --diameter 13
+
+  # Compare two tomogram files against many template rotations:
+  python ccpeaks_plot_claude.py --input tomo1.hdf,tomo2.hdf --template templates_rotated.hdf --npeaks 36 --diameter 15 --threads 32 --peak_method eman2
+  
+  # Process all images but only save coordinate maps for first 10 images:
+  python ccpeaks_plot_claude.py --input tomo_stack.hdf --template template.hdf --save_coords_map 10 --npeaks 50 --diameter 13
+""")
 
     # Parameters (alphabetically ordered)
     parser.add_argument('--cc_thresh', dest='ccc_thresh_sigma', type=float, default=0.0,
@@ -983,9 +997,12 @@ def main():
         # Use the already loaded images to avoid loading them again
         image_list = input_images[i]
         
-        # Only process up to save_coords_map images for each file
-        for img_idx, image_3d in enumerate(image_list[:args.save_coords_map]):
+        # Process ALL images for peak finding, not just the first save_coords_map
+        for img_idx, image_3d in enumerate(image_list):
             shape_by_file_img[(filename, img_idx)] = image_3d.shape
+            
+            # Track which images should have coordinate maps saved (limited by save_coords_map)
+            should_save_coords_map = img_idx < args.save_coords_map
 
             # Calculate local_npeaks (how many peaks to find per template)
             if args.npeaks is None:
@@ -1156,11 +1173,19 @@ def main():
                 f.write(f"{img_idx}\t{av:.6f}\n")
         logging.info(f"Saved average CC values for file {filename} to {out_file}")
 
-    # Plot distributions
+    # Plot and save distribution statistics
     if len(input_files) == 2:
         data_labels = args.data_labels.split(',')
         file1 = os.path.splitext(os.path.basename(input_files[0]))[0]
         file2 = os.path.splitext(os.path.basename(input_files[1]))[0]
+        
+        # Get the total number of images processed for each file
+        img_count1 = len(aggregated_avgs[file1])
+        img_count2 = len(aggregated_avgs[file2])
+        
+        # Log number of images processed
+        logging.info(f"Processed {img_count1} images from {file1}")
+        logging.info(f"Processed {img_count2} images from {file2}")
         
         # Average CC values per image
         avg_data1 = [a for (_, a) in aggregated_avgs[file1]]
@@ -1168,47 +1193,57 @@ def main():
         out_avg_plot = os.path.join(output_dir, "ccs_avgs_plot.png")
         plot_two_distributions(avg_data1, avg_data2, data_labels, out_avg_plot, title="Average CC Value per Image")
         
-        # All CC values - no sampling/subsampling to ensure we use all peaks
+        # All CC values from all images
         dist_data1 = [p[3] for p in aggregated_ccs[file1]]
         dist_data2 = [p[3] for p in aggregated_ccs[file2]]
         
         # Log the actual number of peaks in each distribution
-        logging.info(f"Distribution statistics for {file1}: {len(dist_data1)} peaks from {len(avg_data1)} images")
-        logging.info(f"Distribution statistics for {file2}: {len(dist_data2)} peaks from {len(avg_data2)} images")
+        logging.info(f"Distribution statistics for {file1}: {len(dist_data1)} peaks from {img_count1} images")
+        logging.info(f"Distribution statistics for {file2}: {len(dist_data2)} peaks from {img_count2} images")
         
-        # Check expected peak counts
-        expected_peaks1 = len(avg_data1) * (args.npeaks if args.npeaks else 0)
-        expected_peaks2 = len(avg_data2) * (args.npeaks if args.npeaks else 0)
+        # Check expected peak counts (each image should contribute exactly npeaks)
+        expected_peaks1 = img_count1 * (args.npeaks if args.npeaks else 0)
+        expected_peaks2 = img_count2 * (args.npeaks if args.npeaks else 0)
         
         if expected_peaks1 > 0 and len(dist_data1) != expected_peaks1:
-            logging.warning(f"Expected {expected_peaks1} peaks for {file1} (npeaks={args.npeaks} × {len(avg_data1)} images) but got {len(dist_data1)}")
+            logging.warning(f"Expected {expected_peaks1} peaks for {file1} (npeaks={args.npeaks} × {img_count1} images) but got {len(dist_data1)}")
         if expected_peaks2 > 0 and len(dist_data2) != expected_peaks2:
-            logging.warning(f"Expected {expected_peaks2} peaks for {file2} (npeaks={args.npeaks} × {len(avg_data2)} images) but got {len(dist_data2)}")
+            logging.warning(f"Expected {expected_peaks2} peaks for {file2} (npeaks={args.npeaks} × {img_count2} images) but got {len(dist_data2)}")
             
+        # Create the distribution plot of all peaks
         out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
-        plot_two_distributions(dist_data1, dist_data2, data_labels, out_dist_plot, title="All CC Peak Values")
+        plot_title = f"All CC Peak Values (top {args.npeaks} peaks from all images)"
+        plot_two_distributions(dist_data1, dist_data2, data_labels, out_dist_plot, title=plot_title)
+        
     else:
+        # Single input file case
         file1 = os.path.splitext(os.path.basename(input_files[0]))[0]
         data_label = args.data_labels.split(',')[0]
+        
+        # Get the total number of images processed
+        img_count1 = len(aggregated_avgs[file1])
+        logging.info(f"Processed {img_count1} images from {file1}")
         
         # Average CC values per image
         avg_data = [a for (_, a) in aggregated_avgs[file1]]
         out_avg_plot = os.path.join(output_dir, "ccs_avgs_plot.png")
         plot_two_distributions(avg_data, None, [data_label], out_avg_plot, title="Average CC Value per Image")
         
-        # All CC values
+        # All CC values from all images
         dist_data = [p[3] for p in aggregated_ccs[file1]]
         
         # Log the actual number of peaks in the distribution
-        logging.info(f"Distribution statistics for {file1}: {len(dist_data)} peaks from {len(avg_data)} images")
+        logging.info(f"Distribution statistics for {file1}: {len(dist_data)} peaks from {img_count1} images")
         
         # Check expected peak count
-        expected_peaks = len(avg_data) * (args.npeaks if args.npeaks else 0)
+        expected_peaks = img_count1 * (args.npeaks if args.npeaks else 0)
         if expected_peaks > 0 and len(dist_data) != expected_peaks:
-            logging.warning(f"Expected {expected_peaks} peaks for {file1} (npeaks={args.npeaks} × {len(avg_data)} images) but got {len(dist_data)}")
+            logging.warning(f"Expected {expected_peaks} peaks for {file1} (npeaks={args.npeaks} × {img_count1} images) but got {len(dist_data)}")
             
+        # Create the distribution plot of all peaks
         out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
-        plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title="All CC Peak Values")
+        plot_title = f"All CC Peak Values (top {args.npeaks} peaks from all images)"
+        plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title=plot_title)
 
     # Save CC maps
     if args.save_ccmaps > 0:
@@ -1263,17 +1298,18 @@ def main():
                     save_cc_maps_stack(maps_dict, out_hdf)
                 logging.info(f"Saved {len(maps_dict)} masked CC maps for file {filename} to {out_hdf}")
 
-    # Always build coordinate maps from final peaks (using coords_map_r parameter)
+    # Build coordinate maps from final peaks for the first save_coords_map images only
+    # This saves disk space while still processing all images for peak statistics
     coord_maps_by_file = defaultdict(list)
     for (filename, image_idx), final_peaks in final_peaks_by_img.items():
-        # Only include up to save_coords_map images per file
+        # Only create and save coordinate maps for the first save_coords_map images per file
         if image_idx >= args.save_coords_map:
             continue
             
         shape = shape_by_file_img[(filename, image_idx)]
         coords_map = np.zeros(shape, dtype=np.uint8)
         for (x, y, z, val) in final_peaks:
-            place_sphere(coords_map, (x, y, z), args.coords_map_r)  # Use the new parameter
+            place_sphere(coords_map, (x, y, z), args.coords_map_r)
         coord_maps_by_file[filename].append(coords_map)
         logging.info(f"Created coordinate map for file {filename}, image {image_idx} with {len(final_peaks)} peaks")
 
