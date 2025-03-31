@@ -695,25 +695,40 @@ def final_aggregator_greedy(candidate_list, n_peaks, min_distance):
     it's at least 'min_distance' away from all previously accepted.
     Returns up to n_peaks.
 
-    candidate_list: list of (x, y, z, val)
+    candidate_list: list of (x, y, z, val) or (x, y, z, val, template_idx)
     n_peaks: desired max number of final picks
     min_distance: float, minimum allowed distance between peaks
+    
+    Returns: List of (x, y, z, val) tuples - template_idx is removed if present
     """
-    # Sort descending by CC value
+    # Sort descending by CC value (always 4th element, index 3)
     candidate_list.sort(key=lambda x: x[3], reverse=True)
     accepted = []
 
     # Use the same consistent NMS approach as before
     for cand in candidate_list:
-        x, y, z, val = cand
+        # Get coordinates and value, handling both formats
+        # Original format: (x, y, z, val)
+        # Debug format with template: (x, y, z, val, template_idx)
+        if len(cand) >= 5:
+            x, y, z, val, tmpl_idx = cand[:5]  # Unpack with template index
+        else:
+            x, y, z, val = cand[:4]  # Unpack without template index
+            tmpl_idx = None
+            
         too_close = False
 
-        for (ax, ay, az, a_val) in accepted:
+        # Check distance to all previously accepted peaks
+        for accepted_peak in accepted:
+            ax, ay, az = accepted_peak[:3]  # Get coordinates of accepted peak
+            a_val = accepted_peak[3]  # Get value of accepted peak
+            
             dist = np.linalg.norm([x - ax, y - ay, z - az])
             if dist < min_distance:
+                tmpl_str = f", template={tmpl_idx}" if tmpl_idx is not None else ""
                 logging.debug(
                     f"[DEBUG aggregator] EXCLUDING peak "
-                    f"(x={x}, y={y}, z={z}, val={val:.3f}) "
+                    f"(x={x}, y={y}, z={z}, val={val:.3f}{tmpl_str}) "
                     f"because it's too close to "
                     f"(x={ax}, y={ay}, z={az}, val={a_val:.3f}) "
                     f"[dist={dist:.3f}, min_distance={min_distance}]"
@@ -722,10 +737,12 @@ def final_aggregator_greedy(candidate_list, n_peaks, min_distance):
                 break
 
         if not too_close:
-            accepted.append(cand)
+            # Always store as (x, y, z, val) format without template info
+            accepted.append((x, y, z, val))
+            tmpl_str = f", template={tmpl_idx}" if tmpl_idx is not None else ""
             logging.debug(
                 f"[DEBUG aggregator] ACCEPTING peak #{len(accepted)} => "
-                f"(x={x}, y={y}, z={z}, val={val:.3f})"
+                f"(x={x}, y={y}, z={z}, val={val:.3f}{tmpl_str})"
             )
 
         # Stop if we've reached the requested number of peaks
@@ -738,7 +755,17 @@ def final_aggregator_greedy(candidate_list, n_peaks, min_distance):
 # Plot distribution
 #########################
 
-def plot_two_distributions(data1, data2, labels, output_path, title="ccs_avgs_plot"):
+def plot_two_distributions(data1, data2, labels, output_path, title="CC Distribution"):
+    """
+    Create violin plots comparing one or two distributions of cross-correlation values.
+    
+    Parameters:
+    - data1: First dataset (required)
+    - data2: Second dataset (optional)
+    - labels: Labels for the datasets
+    - output_path: Where to save the plot
+    - title: Main title for the plot
+    """
     data1 = np.asarray(data1)
     if data2 is not None and len(data2) > 0:
         data2 = np.asarray(data2)
@@ -758,7 +785,7 @@ def plot_two_distributions(data1, data2, labels, output_path, title="ccs_avgs_pl
         ax.vlines(1, q1, q3, color='black', lw=5)
         ax.set_xticks([1])
         ax.set_xticklabels(labels[:1])
-        ax.set_ylabel("CC Peak Values")
+        ax.set_ylabel("CC Values")
         ax.set_title(f"{title}\nN={len(data1)}")
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
@@ -824,8 +851,13 @@ def plot_two_distributions(data1, data2, labels, output_path, title="ccs_avgs_pl
 
         ax.set_xticks([1,2])
         ax.set_xticklabels(labels)
-        ax.set_ylabel("CC Peak Values")
-        ax.set_title(f"{title}\nN1={N1}, N2={N2}\np={pval:.6f} ({sig}), {method}={effect:.4f}")
+        ax.set_ylabel("CC Values")
+        
+        # Enhanced title with more information
+        ax.set_title(f"{title}\n{labels[0]}: {N1} values, {labels[1]}: {N2} values\n"
+                    f"p={pval:.6f} ({sig}), {method}={effect:.4f}\n"
+                    f"Mean: {mean1:.3f} vs {mean2:.3f}, Median: {med1:.3f} vs {med2:.3f}")
+        
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
         plt.close(fig)
@@ -1004,7 +1036,10 @@ def main():
         else:  # Without CC map
             filename, image_idx, tmpl_idx, local_peaks = res
 
-        partial_peaks[(filename, image_idx, tmpl_idx)] = local_peaks
+        # Store template index with each peak for debugging
+        # Add the template index as a 5th element in each peak tuple
+        template_annotated_peaks = [(x, y, z, val, tmpl_idx) for (x, y, z, val) in local_peaks]
+        partial_peaks[(filename, image_idx, tmpl_idx)] = template_annotated_peaks
         logging.debug(f"[PER-TEMPLATE] {filename}, img={image_idx}, tmpl={tmpl_idx} => {len(local_peaks)} local picks")
 
     # Combine local picks (all templates) for each (filename, image_idx)
@@ -1035,10 +1070,26 @@ def main():
     for (filename, image_idx), all_candidates in combined_peaks_by_file_img.items():
         logging.info(f"[AGGREGATOR PRE] {filename}, image={image_idx} => {len(all_candidates)} total candidates from all templates")
 
-        # Dump the first 10 candidate peaks for debugging
-        logging.info(f"CANDIDATE PEAKS before aggregation for {filename}, image {image_idx}:")
-        for i, (x, y, z, val) in enumerate(sorted(all_candidates, key=lambda p: p[3], reverse=True)[:min(10, len(all_candidates))]):
-            logging.info(f"  Candidate #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}")
+        # Dump the top few candidate peaks for debugging purposes
+        logging.info(f"DEBUG - CANDIDATE PEAKS before aggregation for {filename}, image {image_idx}:")
+        logging.info(f"NOTE: These candidates come from ALL templates combined! They may be close to each other because")
+        logging.info(f"      they were found in different template correlations. The final peaks after aggregation will")
+        logging.info(f"      enforce the minimum distance of {args.diameter} pixels between peaks.")
+        
+        # Sort by value (4th element)
+        sorted_candidates = sorted(all_candidates, key=lambda p: p[3], reverse=True)
+        max_to_show = min(10, len(sorted_candidates))  # Just show top 10 for debugging
+        for i, peak in enumerate(sorted_candidates[:max_to_show]):
+            # Handle peaks with or without template index 
+            if len(peak) >= 5:
+                x, y, z, val, tmpl_idx = peak
+                logging.info(f"  Candidate #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}, template={tmpl_idx}")
+            else:
+                x, y, z, val = peak
+                logging.info(f"  Candidate #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}")
+                
+        if len(sorted_candidates) > max_to_show:
+            logging.info(f"  ... and {len(sorted_candidates) - max_to_show} more candidates (total: {len(sorted_candidates)})")
         
         # When using EMAN2 method, the mask.sharp is using radius (diameter/2) 
         # so for consistency, we need to use the same minimum distance in the final aggregator
@@ -1069,7 +1120,22 @@ def main():
         logging.info(f"Saved aggregated CC peaks to {out_txt}")
 
         # Accumulate for distribution
-        aggregated_ccs[filename].extend(final_peaks)
+        # Ensure we use exactly npeaks from each image for statistical consistency
+        # If npeaks was specified, use that many peaks, otherwise use all available peaks
+        if args.npeaks and args.npeaks > 0:
+            # Use exactly npeaks per image (truncate or pad with NaN if necessary) 
+            if len(final_peaks) >= args.npeaks:
+                # If we have enough or more peaks, use exactly npeaks
+                aggregated_ccs[filename].extend(final_peaks[:args.npeaks])
+            else:
+                # If we don't have enough peaks, log a warning
+                logging.warning(f"Image {image_idx} in {filename} only has {len(final_peaks)} peaks, not the requested {args.npeaks}")
+                aggregated_ccs[filename].extend(final_peaks)
+        else:
+            # If npeaks wasn't specified, use all available peaks
+            aggregated_ccs[filename].extend(final_peaks)
+            
+        # Calculate average CC value for this image
         avg_val = np.mean([p[3] for p in final_peaks]) if final_peaks else np.nan
         aggregated_avgs[filename].append((image_idx, avg_val))
 
@@ -1095,25 +1161,54 @@ def main():
         data_labels = args.data_labels.split(',')
         file1 = os.path.splitext(os.path.basename(input_files[0]))[0]
         file2 = os.path.splitext(os.path.basename(input_files[1]))[0]
+        
+        # Average CC values per image
         avg_data1 = [a for (_, a) in aggregated_avgs[file1]]
         avg_data2 = [a for (_, a) in aggregated_avgs[file2]]
         out_avg_plot = os.path.join(output_dir, "ccs_avgs_plot.png")
-        plot_two_distributions(avg_data1, avg_data2, data_labels, out_avg_plot, title="ccs_avgs_plot")
-
+        plot_two_distributions(avg_data1, avg_data2, data_labels, out_avg_plot, title="Average CC Value per Image")
+        
+        # All CC values - no sampling/subsampling to ensure we use all peaks
         dist_data1 = [p[3] for p in aggregated_ccs[file1]]
         dist_data2 = [p[3] for p in aggregated_ccs[file2]]
+        
+        # Log the actual number of peaks in each distribution
+        logging.info(f"Distribution statistics for {file1}: {len(dist_data1)} peaks from {len(avg_data1)} images")
+        logging.info(f"Distribution statistics for {file2}: {len(dist_data2)} peaks from {len(avg_data2)} images")
+        
+        # Check expected peak counts
+        expected_peaks1 = len(avg_data1) * (args.npeaks if args.npeaks else 0)
+        expected_peaks2 = len(avg_data2) * (args.npeaks if args.npeaks else 0)
+        
+        if expected_peaks1 > 0 and len(dist_data1) != expected_peaks1:
+            logging.warning(f"Expected {expected_peaks1} peaks for {file1} (npeaks={args.npeaks} × {len(avg_data1)} images) but got {len(dist_data1)}")
+        if expected_peaks2 > 0 and len(dist_data2) != expected_peaks2:
+            logging.warning(f"Expected {expected_peaks2} peaks for {file2} (npeaks={args.npeaks} × {len(avg_data2)} images) but got {len(dist_data2)}")
+            
         out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
-        plot_two_distributions(dist_data1, dist_data2, data_labels, out_dist_plot, title="ccs_distribution_plot")
+        plot_two_distributions(dist_data1, dist_data2, data_labels, out_dist_plot, title="All CC Peak Values")
     else:
         file1 = os.path.splitext(os.path.basename(input_files[0]))[0]
         data_label = args.data_labels.split(',')[0]
+        
+        # Average CC values per image
         avg_data = [a for (_, a) in aggregated_avgs[file1]]
         out_avg_plot = os.path.join(output_dir, "ccs_avgs_plot.png")
-        plot_two_distributions(avg_data, None, [data_label], out_avg_plot, title="ccs_avgs_plot")
-
+        plot_two_distributions(avg_data, None, [data_label], out_avg_plot, title="Average CC Value per Image")
+        
+        # All CC values
         dist_data = [p[3] for p in aggregated_ccs[file1]]
+        
+        # Log the actual number of peaks in the distribution
+        logging.info(f"Distribution statistics for {file1}: {len(dist_data)} peaks from {len(avg_data)} images")
+        
+        # Check expected peak count
+        expected_peaks = len(avg_data) * (args.npeaks if args.npeaks else 0)
+        if expected_peaks > 0 and len(dist_data) != expected_peaks:
+            logging.warning(f"Expected {expected_peaks} peaks for {file1} (npeaks={args.npeaks} × {len(avg_data)} images) but got {len(dist_data)}")
+            
         out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
-        plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title="ccs_distribution_plot")
+        plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title="All CC Peak Values")
 
     # Save CC maps
     if args.save_ccmaps > 0:
@@ -1133,23 +1228,40 @@ def main():
                 filename, image_idx, tmpl_idx = key
                 cc_maps_by_file_img[(filename, image_idx)][tmpl_idx] = value
         
-        # Save original CC maps
-        for (filename, image_idx), maps_dict in cc_maps_by_file_img.items():
-            out_hdf = os.path.join(output_dir, f"{filename}_img{image_idx}_cc_maps.hdf")
+        # Group all maps by filename to save as stacks
+        cc_maps_by_file = defaultdict(dict)
+        cc_maps_masked_by_file = defaultdict(dict)
+        
+        # Process and organize maps into stacks by file
+        for key, value in cc_maps.items():
+            filename, image_idx, tmpl_idx = key
+            if isinstance(value, tuple) and len(value) == 2:
+                # We have both original and masked maps
+                cc_map_raw, cc_map_masked = value
+                cc_maps_by_file[filename][f"{image_idx}_{tmpl_idx}"] = cc_map_raw
+                cc_maps_masked_by_file[filename][f"{image_idx}_{tmpl_idx}"] = cc_map_masked
+            else:
+                # We just have the original map
+                cc_maps_by_file[filename][f"{image_idx}_{tmpl_idx}"] = value
+        
+        # Save original CC maps as one stack per file
+        for filename, maps_dict in cc_maps_by_file.items():
+            out_hdf = os.path.join(output_dir, f"{filename}_cc_maps.hdf")
             if EMAN2_AVAILABLE:
                 save_cc_maps_stack_eman2(maps_dict, out_hdf)
             else:
                 save_cc_maps_stack(maps_dict, out_hdf)
+            logging.info(f"Saved {len(maps_dict)} CC maps for file {filename} to {out_hdf}")
                 
         # Save masked CC maps for debugging (if available)
-        for (filename, image_idx), maps_dict in cc_maps_masked_by_file_img.items():
-            out_hdf = os.path.join(output_dir, f"{filename}_img{image_idx}_cc_maps_masked.hdf")
-            if EMAN2_AVAILABLE:
-                save_cc_maps_stack_eman2(maps_dict, out_hdf)
-                logging.info(f"Saved masked CC maps for debugging to {out_hdf}")
-            else:
-                save_cc_maps_stack(maps_dict, out_hdf)
-                logging.info(f"Saved masked CC maps for debugging to {out_hdf}")
+        for filename, maps_dict in cc_maps_masked_by_file.items():
+            if maps_dict:  # Only if we have masked maps
+                out_hdf = os.path.join(output_dir, f"{filename}_cc_maps_masked.hdf")
+                if EMAN2_AVAILABLE:
+                    save_cc_maps_stack_eman2(maps_dict, out_hdf)
+                else:
+                    save_cc_maps_stack(maps_dict, out_hdf)
+                logging.info(f"Saved {len(maps_dict)} masked CC maps for file {filename} to {out_hdf}")
 
     # Always build coordinate maps from final peaks (using coords_map_r parameter)
     coord_maps_by_file = defaultdict(list)
