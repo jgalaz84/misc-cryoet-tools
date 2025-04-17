@@ -169,26 +169,67 @@ def parse_hdf_apix_and_mean(file_path):
     except:
         return (None, None)
 
-def load_image(file_path):
+def load_image(file_path, img_idx=None):
+    """
+    Load images from a file.
+    
+    Args:
+        file_path: Path to the image file
+        img_idx: If provided, loads only the specified image index.
+                 If None, loads all images.
+    
+    Returns:
+        A list of images if img_idx is None, or a single image if img_idx is specified.
+    """
     ext = os.path.splitext(file_path)[1].lower()
     try:
         if ext in ['.hdf', '.h5']:
             with h5py.File(file_path, 'r') as file:
-                dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
-                images = [file[ds][:] for ds in dataset_paths]
-            return images
+                if img_idx is not None:
+                    # Load only the requested image
+                    dataset_path = f"MDF/images/{img_idx}/image"
+                    return file[dataset_path][:]
+                else:
+                    # Load all images
+                    dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
+                    images = [file[ds][:] for ds in dataset_paths]
+                    return images
         elif ext == '.mrc':
             with mrcfile.open(file_path, permissive=True) as mrc:
                 data = mrc.data
-                if data.ndim == 3:
-                    return [data]
-                elif data.ndim >= 4:
-                    return [d for d in data]
+                if img_idx is not None:
+                    if data.ndim == 3:
+                        # Only one image in the file
+                        if img_idx == 0:
+                            return data
+                        else:
+                            raise ValueError(f"Image index {img_idx} out of range for MRC file with one image")
+                    elif data.ndim >= 4:
+                        # Multiple images in the file
+                        if img_idx < len(data):
+                            return data[img_idx]
+                        else:
+                            raise ValueError(f"Image index {img_idx} out of range for MRC file with {len(data)} images")
+                    else:
+                        if img_idx == 0:
+                            return data
+                        else:
+                            raise ValueError(f"Image index {img_idx} out of range for MRC file with one image")
                 else:
-                    return [data]
+                    # Return all images
+                    if data.ndim == 3:
+                        return [data]
+                    elif data.ndim >= 4:
+                        return [d for d in data]
+                    else:
+                        return [data]
         else:
             raise ValueError(f"Unsupported file format: {ext}")
     except Exception as e:
+        logging.error(f"Error loading image from {file_path}: {str(e)}")
+        if img_idx is not None:
+            logging.error(f"Specified image index: {img_idx}")
+        raise
         logging.error(f"Error loading file {file_path}: {e}")
         return None
 
@@ -229,7 +270,7 @@ def adjust_template(template, target_shape):
     new_template[tuple(slices_target)] = template[tuple(slices_template)]
     return new_template
 
-def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", background_radius=None, background_edge=None):
+def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", background_radius=None, background_edge=None, cc_clip_size=None):
     """
     Compute the normalized cross-correlation (CC) map between 'image' and 'template' using FFT-based correlation.
     
@@ -251,6 +292,9 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
         background_edge: Optional integer specifying the thickness (in voxels) from the edges to 
                          use for computing background statistics. Voxels within this distance from
                          any face of the volume are considered background.
+        cc_clip_size: Optional integer specifying the size of a central cubic region to focus
+                      cross-correlation analysis on. If provided, only this central region will
+                      be analyzed for peaks, while the full volume is still used for normalization.
     
     Returns:
         cc_map: The normalized cross-correlation map.
@@ -258,6 +302,31 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
     if image.shape != template.shape:
         template = adjust_template(template, image.shape)
     cc_map = correlate(image, template, mode='same', method='fft')
+    
+    # Store the full CC map for normalization
+    full_cc_map = cc_map.copy()
+    
+    # Apply cc_clip_size if provided to focus on a central region
+    if cc_clip_size is not None:
+        # Validate cc_clip_size
+        min_image_dim = min(cc_map.shape)
+        if cc_clip_size < 10 or cc_clip_size >= min_image_dim:
+            raise ValueError(f"--cc_clip_size must be between 10 and {min_image_dim - 1} (smallest image dimension - 1); got {cc_clip_size}")
+        
+        # Calculate the slice indices for the central cubic region
+        center = np.array(cc_map.shape) // 2
+        half_size = cc_clip_size // 2
+        
+        # Create slices for the central region
+        z_start, z_end = max(0, center[0] - half_size), min(cc_map.shape[0], center[0] + half_size)
+        y_start, y_end = max(0, center[1] - half_size), min(cc_map.shape[1], center[1] + half_size)
+        x_start, x_end = max(0, center[2] - half_size), min(cc_map.shape[2], center[2] + half_size)
+        
+        # Create a mask that is True outside the central region (to zero out these values later)
+        mask_outside_clip = np.ones(cc_map.shape, dtype=bool)
+        mask_outside_clip[z_start:z_end, y_start:y_end, x_start:x_end] = False
+        
+        logging.debug(f"Using cc_clip_size={cc_clip_size}. Central region: z={z_start}:{z_end}, y={y_start}:{y_end}, x={x_start}:{x_end}")
 
     if cc_norm_method == "background":
         # Create the background mask based on the provided method
@@ -292,7 +361,7 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
         # Default: Edge-based background with thickness of 3 voxels
         else:
             # Default edge thickness is 3 voxels or 5% of smallest dimension (whichever is larger)
-            default_edge = max(3, int(min(cc_map.shape) * 0.05))
+            default_edge = max(3, int(min(full_cc_map.shape) * 0.05))
             default_edge = min(default_edge, min(cc_map.shape) // 10)  # Cap at 10% of smallest dimension
             
             # Create edge-based mask with default thickness
@@ -301,15 +370,15 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
                    (Y < default_edge) | (Y >= ny - default_edge) | \
                    (X < default_edge) | (X >= nx - default_edge)
             
-        # Calculate background statistics from the selected mask
+        # Calculate background statistics from the selected mask (using full_cc_map for stats)
         if np.any(mask):
-            bg_mean = np.mean(cc_map[mask])
-            bg_std = np.std(cc_map[mask])
+            bg_mean = np.mean(full_cc_map[mask])
+            bg_std = np.std(full_cc_map[mask])
             logging.debug(f"Background stats from {np.sum(mask)} voxels: mean={bg_mean:.4f}, std={bg_std:.4f}")
         else:
             # Fallback if mask is empty (should never happen with our checks)
-            bg_mean = np.mean(cc_map)
-            bg_std = np.std(cc_map)
+            bg_mean = np.mean(full_cc_map)
+            bg_std = np.std(full_cc_map)
             logging.warning("Background mask is empty; using whole map statistics")
             
         # Normalize using background statistics
@@ -317,13 +386,21 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
         
     elif cc_norm_method == "mad":
         # MAD normalization: subtract median, divide by median absolute deviation
-        med = np.median(cc_map)
-        mad = np.median(np.abs(cc_map - med))
+        # Use full_cc_map for statistics
+        med = np.median(full_cc_map)
+        mad = np.median(np.abs(full_cc_map - med))
         cc_map = (cc_map - med) / (mad if mad != 0 else 1)
         
     else:  # standard normalization
         # Z-score normalization: subtract mean, divide by standard deviation
-        cc_map = (cc_map - np.mean(cc_map)) / np.std(cc_map)
+        # Use full_cc_map for statistics
+        cc_map = (cc_map - np.mean(full_cc_map)) / np.std(full_cc_map)
+    
+    # Apply clip mask if cc_clip_size was specified
+    if cc_clip_size is not None:
+        # Set all values outside the central region to -infinity to exclude them from peak finding
+        cc_map[mask_outside_clip] = -np.inf
+        logging.info(f"Applied cc_clip_size={cc_clip_size}: focusing analysis on central region while using full volume for normalization")
         
     return cc_map
 
@@ -433,6 +510,8 @@ def mask_out_region_xyz(arr, x0, y0, z0, diameter):
 
 def iterative_nms_eman2(cc_map_np, n_peaks, diameter, cc_thresh, verbose=False):
     from EMAN2 import EMNumPy, EMData
+    if diameter is None:
+        diameter = 35.0  # Default if not provided
     radius = diameter / 2.0
     radius_squared = radius * radius
     if verbose:
@@ -655,14 +734,26 @@ def process_image_template(args_tuple):
     """
 
     try:
-        (filename, image_idx, template_idx, image, template,
-         n_peaks_local, cc_thresh, diameter, store_ccmap, method, template_path,
-         cc_norm_method, background_radius, background_edge) = args_tuple
-
+        # Handle both old and new parameter format
+        if len(args_tuple) == 14:  # New format with cc_clip_size
+            (filename, image_idx, template_idx, image, template,
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method,
+             cc_norm_method, background_radius, background_edge, cc_clip_size) = args_tuple
+        else:  # Old format
+            (filename, image_idx, template_idx, image, template,
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method,
+             cc_norm_method, background_radius, background_edge) = args_tuple
+            cc_clip_size = None
+            
+        # Ensure diameter is not None
+        if diameter is None:
+            diameter = 35.0  # Default diameter if not specified
+            
         cc_map = compute_ncc_map_3d_single(image, template, 
                                            cc_norm_method=cc_norm_method, 
                                            background_radius=background_radius,
-                                           background_edge=background_edge)
+                                           background_edge=background_edge,
+                                           cc_clip_size=cc_clip_size)
         
         # Apply thresholding if requested.
         if cc_thresh > 0:
@@ -738,6 +829,11 @@ def final_aggregator_greedy(candidate_list, n_peaks, min_distance):
 #########################
 
 def plot_two_distributions(data1, data2, labels, output_path, title="CC Distribution"):
+    # Handle empty data
+    if len(data1) == 0:
+        logging.warning(f"plot_two_distributions: data1 is empty, cannot create plot {output_path}")
+        return
+        
     data1 = np.asarray(data1)
     if data2 is not None and len(data2) > 0:
         data2 = np.asarray(data2)
@@ -899,51 +995,55 @@ def main():
                              "Creates a shell mask where voxels within this distance from any face are considered background.\n"
                              "Must be between 2 and 1/4 of the smallest image dimension. Mutually exclusive with --background_radius.")
     
-    # Other parameters
+    # Other parameters (alphabetically ordered)
+    parser.add_argument('--cc_clip_size', type=int, default=None,
+                        help="Default=None (use full volume). Size of central cubic region to focus cross-correlation analysis on. \n"
+                             "If provided, only analyzes peaks within this central region while still using the full volume\n"
+                             "for background normalization. Useful when you want to normalize using background beyond the\n"
+                             "particle but focus analysis on a specific interior region.")
     parser.add_argument('--cc_norm_method', type=str, default="mad", choices=["background", "mad", "standard"],
-                        help="CC normalization method; default 'mad'. Use 'background' to use background voxels for normalization.")
+                        help="Default='mad'. CC normalization method. Use 'background' to use background voxels for normalization.")
     parser.add_argument('--cc_thresh', dest='ccc_thresh_sigma', type=float, default=0.0,
-                        help="Threshold for picking peaks in sigma units above the mean. Default=0.0 (disabled).")
-    # ... (other parameters remain unchanged) ...
-    parser.add_argument('--data_labels', type=str, default="file1,file2",
-                        help="Comma-separated labels for datasets. Default='file1,file2'.")
-    parser.add_argument('--diameter', type=float, default=None,
-                        help="Minimum allowed distance (voxels) between final peaks. Auto-derived if not provided.")
-    parser.add_argument('--input', required=True,
-                        help="Comma-separated tomogram file paths; maximum 2 allowed.")
-    parser.add_argument('--match_sets_size', action='store_true', default=False,
-                        help="If set, automatically match sets to the size of the smallest set when two input files are provided.")
-    parser.add_argument('--npeaks', type=int, default=None,
-                        help="Number of final peaks to keep per image. Auto-calculated if not provided.")
-    parser.add_argument('--output_dir', default="cc_analysis",
-                        help="Base output directory. Default='cc_analysis'.")
-    parser.add_argument('--peak_method', type=str, default="original",
-                        help="Peak-finding method; options: 'original', 'eman2', 'vectorized', 'fallback'. Default='original'.")
-    parser.add_argument('--save_ccmaps', type=int, default=1,
-                        help="Number of CC maps to save per input file. Default=1.")
-    parser.add_argument('--save_csv', action='store_true', default=False,
-                        help="Export a CSV summary of extracted peaks. Default=False.")
-    parser.add_argument('--save_coords_map', type=int, default=1,
-                        help="Number of coordinate maps to save per input file. Default=1.")
+                        help="Default=0.0 (disabled). Threshold for picking peaks in sigma units above the mean.")
     parser.add_argument('--coords_map_r', type=int, default=3, 
-                        help="Radius (in voxels) for spheres in coordinate maps. Default=3.")
+                        help="Default=3. Radius (in voxels) for spheres in coordinate maps.")
+    parser.add_argument('--data_labels', type=str, default="file1,file2",
+                        help="Default='file1,file2'. Comma-separated labels for datasets.")
+    parser.add_argument('--diameter', type=float, default=None,
+                        help="Default=None (auto). Minimum allowed distance (voxels) between final peaks.")
+    parser.add_argument('--input', required=True,
+                        help="Required. Comma-separated tomogram file paths; maximum 2 allowed.")
+    parser.add_argument('--match_sets_size', action='store_true', default=False,
+                        help="Default=False. If set, automatically match sets to the size of the smallest set when two input files are provided.")
+    parser.add_argument('--npeaks', type=int, default=None,
+                        help="Default=None (auto). Number of final peaks to keep per image.")
+    parser.add_argument('--output_dir', default="cc_analysis",
+                        help="Default='cc_analysis'. Base output directory.")
+    parser.add_argument('--peak_method', type=str, default="original",
+                        help="Default='original'. Peak-finding method; options: 'original', 'eman2', 'vectorized', 'fallback'.")
+    parser.add_argument('--save_cc_maps', type=int, default=1,
+                        help="Default=1. Number of CC maps to save per input file.")
+    parser.add_argument('--save_coords_maps', type=int, default=1,
+                        help="Default=1. Number of coordinate maps to save per input file.")
+    parser.add_argument('--save_csv', action='store_true', default=False,
+                        help="Default=False. Export a CSV summary of extracted peaks.")
     parser.add_argument('--subset', type=int, default=None,
-                        help="Process only the first n images from each input file. Use this to set a specific subset size.")
+                        help="Default=None. Process only the first n images from each input file. Use this to set a specific subset size.")
     parser.add_argument('--template', required=True,
-                        help="Template file path (HDF allowed).")
+                        help="Required. Template file path (HDF allowed).")
     parser.add_argument('--threads', type=int, default=1,
-                        help="Number of parallel processes. Default=1.")
+                        help="Default=1. Number of parallel processes.")
     parser.add_argument('--verbose', type=int, default=2,
-                        help="Verbosity level: 0=ERROR, 1=WARNING, 2=INFO, 3=DEBUG. Default=2.")
+                        help="Default=2. Verbosity level: 0=ERROR, 1=WARNING, 2=INFO, 3=DEBUG.")
 
     args = parser.parse_args()
 
     # Early validations:
-    if args.save_ccmaps < 1:
-        logging.error("--save_ccmaps must be >= 1.")
+    if args.save_cc_maps < 1:
+        logging.error("--save_cc_maps must be >= 1.")
         sys.exit(1)
-    if args.save_coords_map < 1:
-        logging.error("--save_coords_map must be >= 1.")
+    if args.save_coords_maps < 1:
+        logging.error("--save_coords_maps must be >= 1.")
         sys.exit(1)
 
     input_files = args.input.split(',')
@@ -970,31 +1070,89 @@ def main():
     n_templates = len(templates)
     logging.info(f"Loaded {n_templates} template(s) from {args.template}")
 
-    if args.save_ccmaps > n_templates:
-        logging.info(f"--save_ccmaps ({args.save_ccmaps}) is greater than the number of templates ({n_templates}); reducing to {n_templates}.")
-        args.save_ccmaps = n_templates
+    if args.save_cc_maps > n_templates:
+        logging.info(f"--save_ccmaps ({args.save_cc_maps}) is greater than the number of templates ({n_templates}); reducing to {n_templates}.")
+        args.save_cc_maps = n_templates
 
-    # Load input images.
+    # Initialize variables
     image_counts = []
     input_images = []
-    for f in input_files:
-        ims = load_image(f)
-        if (ims is None) or (len(ims) == 0):
-            logging.error(f"Could not load tomogram {f}. Exiting.")
+    tasks = []
+    shape_by_file_img = {}
+    
+    # Load all images
+    for i, f in enumerate(input_files):
+        check_apix(f, args.template)
+        
+        # Load images
+        images = load_image(f)
+        if images is None or len(images) == 0:
+            logging.error(f"Could not load images from {f}. Exiting.")
             sys.exit(1)
-        image_counts.append(len(ims))
-        input_images.append(ims)
+            
+        num_images = len(images)
+        image_counts.append(num_images)
+        input_images.append(images)
+    
+    # After loading input images, determine the smallest dimension across all input images.
+    all_dims = []
+    for file_images in input_images:
+        for im in file_images:
+            all_dims.append(min(im.shape))
+    
+    if not all_dims:
+        logging.error("No images loaded!")
+        sys.exit(1)
+    
+    global_min_dim = min(all_dims)
+    
+    # Get first image shape for auto-diameter calculation
+    first_tomo_shape = input_images[0][0].shape
+    
+    # Auto-calculate diameter if not provided
+    if args.diameter is None:
+        auto_diameter = compute_auto_diameter(templates[0], first_tomo_shape)
+        args.diameter = auto_diameter
+        logging.info(f"No diameter provided; using auto-derived diameter: {auto_diameter}")
 
-
-        # After loading input images, determine the smallest dimension across all input images.
-        all_dims = []
-        for file_images in input_images:
-            for im in file_images:
-                all_dims.append(min(im.shape))
-        if not all_dims:
-            logging.error("No images loaded!")
-            sys.exit(1)
-        global_min_dim = min(all_dims)
+    # Build the task list using the loaded images
+    tasks = []
+    for i, images in enumerate(input_images):
+        filename = os.path.splitext(os.path.basename(input_files[i]))[0]
+        
+        for img_idx, image in enumerate(images):
+            shape_by_file_img[(filename, img_idx)] = image.shape
+            
+            # Calculate local_npeaks
+            if args.npeaks is None:
+                if args.diameter is None:
+                    logging.error("Diameter is None and required for auto-calculating npeaks")
+                    sys.exit(1)
+                diam_int = int(args.diameter)
+                n_possible = (image.shape[0] // diam_int) * (image.shape[1] // diam_int) * (image.shape[2] // diam_int)
+                local_npeaks = n_possible
+            else:
+                local_npeaks = args.npeaks
+            
+            # Create tasks for each template
+            for tmpl_idx, template_data in enumerate(templates):
+                store_map = (tmpl_idx < args.save_cc_maps)
+                tasks.append((
+                    filename,
+                    img_idx,
+                    tmpl_idx,
+                    image,
+                    template_data,
+                    local_npeaks,
+                    args.ccc_thresh_sigma,
+                    args.diameter,
+                    store_map,
+                    args.peak_method,
+                    args.cc_norm_method,
+                    args.background_radius,
+                    args.background_edge,
+                    args.cc_clip_size
+                ))
 
     # right after loading all input_images and computing global_min_dim:
     if args.cc_norm_method == "background":
@@ -1042,8 +1200,8 @@ def main():
             args.background_edge = default_edge
             logging.info(f"No background parameters provided; defaulting to edge-based with thickness={default_edge}")
             
-        # Remove cc_clip_size to ensure it's not used
-        # No need to handle cc_clip_size anymore
+        # cc_clip_size is now independent of background normalization
+        # It can be used to focus analysis on the central region regardless of normalization method
 
     first_tomo_shape = input_images[0][0].shape
 
@@ -1060,49 +1218,9 @@ def main():
             input_images[i] = input_images[i][:new_count]
         logging.info(f"Using --subset: processing first {new_count} images from each input file.")
 
-    # No longer need cc_clip_size validation
-
-
-    if args.diameter is None:
-        auto_diameter = compute_auto_diameter(templates[0], first_tomo_shape)
-        args.diameter = auto_diameter
-        logging.info(f"No diameter provided; using auto-derived diameter: {auto_diameter}")
+    # cc_clip_size is now independent of background normalization
 
     logging.info(f"Starting memory usage: {psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024):.2f} MB")
-
-    # Build task list – note that we now append background_radius to each task.
-    tasks = []
-    shape_by_file_img = {}
-    for i, f in enumerate(input_files):
-        filename = os.path.splitext(os.path.basename(f))[0]
-        check_apix(f, args.template)
-        ims = input_images[i]
-        for img_idx, im in enumerate(ims):
-            shape_by_file_img[(filename, img_idx)] = im.shape
-            if args.npeaks is None:
-                diam_int = int(args.diameter)
-                n_possible = (im.shape[0] // diam_int) * (im.shape[1] // diam_int) * (im.shape[2] // diam_int)
-                local_npeaks = n_possible
-            else:
-                local_npeaks = args.npeaks
-            for tmpl_idx, template_data in enumerate(templates):
-                store_map = (tmpl_idx < args.save_ccmaps)
-                tasks.append((
-                    filename,
-                    img_idx,
-                    tmpl_idx,
-                    im,
-                    template_data,
-                    local_npeaks,
-                    args.ccc_thresh_sigma,
-                    args.diameter,
-                    store_map,
-                    args.peak_method,
-                    args.template,
-                    args.cc_norm_method,
-                    args.background_radius,
-                    args.background_edge  # Add edge-based parameter
-                ))
    
     # Process tasks in parallel.
     partial_results = []
@@ -1209,7 +1327,7 @@ def main():
         out_dist_plot = os.path.join(output_dir, "ccs_distribution_plot.png")
         plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title="All CC Peak Values")
 
-    if args.save_ccmaps > 0:
+    if args.save_cc_maps > 0:
         cc_maps_by_file_img = defaultdict(dict)
         cc_maps_masked_by_file_img = defaultdict(dict)
         for key, value in cc_maps.items():
@@ -1244,8 +1362,8 @@ def main():
     coord_maps_by_file = defaultdict(list)
     
     for (filename, image_idx), final_peaks in final_peaks_by_img.items():
-        # Only process the first args.save_coords_map images
-        if image_idx >= args.save_coords_map:
+        # Only process the first args.save_coords_maps images
+        if image_idx >= args.save_coords_maps:
             continue
             
         # Get shape from the original image
@@ -1265,7 +1383,7 @@ def main():
         logging.info(f"Created coordinate map for file {filename}, image {image_idx} with {len(final_peaks)} peaks")
 
     for filename, maps_list in coord_maps_by_file.items():
-        maps_to_save = maps_list[:args.save_coords_map]
+        maps_to_save = maps_list[:args.save_coords_maps]
         out_map = os.path.join(output_dir, f"{filename}_coords_map.hdf")
         save_coords_map_as_hdf(maps_to_save, out_map)
         logging.info(f"Saved {len(maps_to_save)} coordinate map(s) for file {filename} to {out_map}")
@@ -1410,25 +1528,6 @@ def parse_hdf_apix_and_mean(file_path):
     except:
         return (None, None)
 
-def load_image(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    try:
-        if ext in ['.hdf', '.h5']:
-            with h5py.File(file_path, 'r') as file:
-                dataset_paths = [f"MDF/images/{i}/image" for i in range(len(file["MDF/images"]))]
-                images = [file[ds][:] for ds in dataset_paths]
-            return images
-        elif ext == '.mrc':
-            with mrcfile.open(file_path, permissive=True) as mrc:
-                data = mrc.data
-                if data.ndim == 3:
-                    return [data]
-                elif data.ndim >= 4:
-                    return [d for d in data]
-                else:
-                    return [data]
-        else:
-            raise ValueError(f"Unsupported file format: {ext}")
     except Exception as e:
         logging.error(f"Error loading file {file_path}: {e}")
         return None
@@ -1617,6 +1716,10 @@ def iterative_nms_eman2(cc_map_np, n_peaks, diameter, cc_thresh, verbose=False):
     """
     from EMAN2 import EMNumPy, EMData
     
+    # Ensure diameter is not None
+    if diameter is None:
+        diameter = 35.0  # Default if not provided
+        
     # Calculate radius as half of the diameter
     radius = diameter / 2.0
     radius_squared = radius * radius
@@ -1917,78 +2020,7 @@ def compute_auto_diameter(template, tomo_shape):
     
     return auto_diameter
 
-#########################
-# Worker function
-#########################
-
-def process_image_template(args_tuple):
-    """
-    1) Compute CC map,
-    2) Use peak finding method as specified by the user,
-    3) Return final picks + optional CC map if store_ccmap==True.
-    
-    This function supports three peak-finding methods:
-    - "original": Uses the original reliable NMS algorithm
-    - "eman2": Uses EMAN2's masking approach for NMS
-    - "fallback": Uses a pure-Python approach, no EMAN2 required
-    """
-    try:
-        (filename, image_idx, template_idx, image, template,
-         n_peaks_local, cc_thresh, diameter, store_ccmap, method, template_path) = args_tuple
-
-        # 1) Compute normalized cross-correlation map
-        cc_map = compute_ncc_map_3d_single(image, template)
-
-        # 2) Find peaks using appropriate method
-        if method == "eman2" and EMAN2_AVAILABLE:
-            # Use EMAN2 for peak finding - note that this uses the "outer_radius" parameter 
-            # which is set to radius (half of diameter)
-            radius = diameter / 2.0
-            logging.debug(f"Using EMAN2 method with mask.sharp outer_radius={radius} (diameter={diameter})")
-            local_peaks, cc_map_masked = iterative_nms_eman2(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
-            
-            # Save masked CC map for debugging EMAN2 method
-            if store_ccmap and template_idx == 0:
-                # Return both the original cc_map and masked map for debugging
-                return (filename, image_idx, template_idx, local_peaks, cc_map, cc_map_masked)
-                
-        elif method == "fallback" or (method == "eman2" and not EMAN2_AVAILABLE):
-            # Use fallback method when EMAN2 is requested but not available,
-            # or when fallback is explicitly requested
-            logging.debug(f"Using fallback method (no EMAN2) with diameter={diameter}")
-            local_peaks, cc_map_masked = fallback_iterative_nms(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
-        else:
-            # Default to original NMS algorithm - most reliable for n_peaks
-            logging.debug(f"Using original method with diameter={diameter}")
-            if cc_thresh > 0:
-                thresh = cc_map.mean() + cc_thresh * cc_map.std()
-                cc_map_thresholded = np.where(cc_map >= thresh, cc_map, -np.inf)
-                local_peaks = non_maximum_suppression(cc_map_thresholded, n_peaks_local, diameter)
-            else:
-                local_peaks = non_maximum_suppression(cc_map, n_peaks_local, diameter)
-            cc_map_masked = None  # Not needed for original method
-
-        # Log how many peaks were actually found
-        logging.debug(f"Found {len(local_peaks)} peaks for file {filename}, image {image_idx}, template {template_idx}")
-
-        # Dump peak coordinates for debugging (just for the first template)
-        if template_idx == 0:
-            logging.info(f"PEAK COORDINATES for {filename}, image {image_idx}, template {template_idx}:")
-            for i, (x, y, z, val) in enumerate(local_peaks[:min(10, len(local_peaks))]):  # Show first 10 peaks
-                logging.info(f"  Peak #{i+1}: (x={x}, y={y}, z={z}), val={val:.3f}")
-            if len(local_peaks) > 10:
-                logging.info(f"  ... and {len(local_peaks)-10} more peaks")
-
-        # local_peaks are in format (x, y, z, val)
-        if store_ccmap:
-            return (filename, image_idx, template_idx, local_peaks, cc_map)
-        else:
-            return (filename, image_idx, template_idx, local_peaks)
-
-    except Exception as e:
-        logging.error(f"Error processing file {filename} image {image_idx} template {template_idx}: {e}")
-        logging.error(traceback.format_exc())
-        return None
+# Removed duplicate process_image_template function
 
 #########################
 # Final aggregator
@@ -2071,6 +2103,10 @@ def plot_two_distributions(data1, data2, labels, output_path, title="CC Distribu
     - output_path: Where to save the plot
     - title: Main title for the plot
     """
+    # Handle empty data
+    if len(data1) == 0:
+        logging.warning(f"plot_two_distributions: data1 is empty, cannot create plot {output_path}")
+        return
     data1 = np.asarray(data1)
     if data2 is not None and len(data2) > 0:
         data2 = np.asarray(data2)
@@ -2207,9 +2243,9 @@ Examples:
                         help="Base name for output directory. Default='cc_analysis'.")
     parser.add_argument('--peak_method', type=str, default="original",
                         help="Peak finding method (options: 'original', 'eman2', 'fallback'). Default='original'.")
-    parser.add_argument('--save_ccmaps', type=int, default=1,
+    parser.add_argument('--save_cc_maps', type=int, default=1,
                         help="How many CC maps to save per input file. Default=1.")
-    parser.add_argument('--save_coords_map', type=int, default=1,
+    parser.add_argument('--save_coords_maps', type=int, default=1,
                         help="How many coordinate maps to save per input file. Default=1.")
     parser.add_argument('--save_csv', action='store_true', default=False,
                         help="Export a CSV summary of all extracted peaks. Default=False.")
@@ -2223,12 +2259,12 @@ Examples:
     args = parser.parse_args()
 
     # Basic validations
-    if args.save_ccmaps < 1:
-        logging.error("--save_ccmaps must be >= 1.")
+    if args.save_cc_maps < 1:
+        logging.error("--save_cc_maps must be >= 1.")
         sys.exit(1)
         
-    if args.save_coords_map < 1:
-        logging.error("--save_coords_map must be >= 1.")
+    if args.save_coords_maps < 1:
+        logging.error("--save_coords_maps must be >= 1.")
         sys.exit(1)
     
     # Check number of input files
@@ -2259,9 +2295,9 @@ Examples:
     logging.info(f"Loaded {n_templates} template(s) from {args.template}")
 
     # Enforce that save_ccmaps is not > number of templates
-    if args.save_ccmaps > n_templates:
-        logging.info(f"--save_ccmaps={args.save_ccmaps} but only {n_templates} template(s) present. Reducing to {n_templates}.")
-        args.save_ccmaps = n_templates
+    if args.save_cc_maps > n_templates:
+        logging.info(f"--save_ccmaps={args.save_cc_maps} but only {n_templates} template(s) present. Reducing to {n_templates}.")
+        args.save_cc_maps = n_templates
 
     # Load input files and check sizes
     image_counts = []
@@ -2280,9 +2316,9 @@ Examples:
     
     # Cap the save_coords_map to minimum count of images
     min_images = min(image_counts)
-    if args.save_coords_map > min_images:
-        logging.info(f"--save_coords_map={args.save_coords_map} but minimum image count is {min_images}. Reducing to {min_images}.")
-        args.save_coords_map = min_images
+    if args.save_coords_maps > min_images:
+        logging.info(f"--save_coords_map={args.save_coords_maps} but minimum image count is {min_images}. Reducing to {min_images}.")
+        args.save_coords_maps = min_images
 
     # Auto diameter if needed
     if args.diameter is None:
@@ -2307,7 +2343,7 @@ Examples:
             shape_by_file_img[(filename, img_idx)] = image_3d.shape
             
             # Track which images should have coordinate maps saved (limited by save_coords_map)
-            should_save_coords_map = img_idx < args.save_coords_map
+            should_save_coords_map = img_idx < args.save_coords_maps
 
             # Calculate local_npeaks (how many peaks to find per template)
             if args.npeaks is None:
@@ -2319,7 +2355,7 @@ Examples:
 
             # For each template
             for tmpl_idx, template_data in enumerate(templates):
-                store_map = (tmpl_idx < args.save_ccmaps)  # only store CC map for first N templates
+                store_map = (tmpl_idx < args.save_cc_maps)  # only store CC map for first N templates
                 tasks.append((
                     filename,
                     img_idx,
@@ -2551,7 +2587,7 @@ Examples:
         plot_two_distributions(dist_data, None, [data_label], out_dist_plot, title=plot_title)
 
     # Save CC maps
-    if args.save_ccmaps > 0:
+    if args.save_cc_maps > 0:
         cc_maps_by_file_img = defaultdict(dict)
         cc_maps_masked_by_file_img = defaultdict(dict)
         
@@ -2608,7 +2644,7 @@ Examples:
     coord_maps_by_file = defaultdict(list)
     for (filename, image_idx), final_peaks in final_peaks_by_img.items():
         # Only create and save coordinate maps for the first save_coords_map images per file
-        if image_idx >= args.save_coords_map:
+        if image_idx >= args.save_coords_maps:
             continue
             
         shape = shape_by_file_img[(filename, image_idx)]
@@ -2621,7 +2657,7 @@ Examples:
     # Save coordinate maps
     for filename, maps_list in coord_maps_by_file.items():
         # Ensure we only save up to save_coords_map maps per file
-        maps_to_save = maps_list[:args.save_coords_map]
+        maps_to_save = maps_list[:args.save_coords_maps]
         out_map = os.path.join(output_dir, f"{filename}_coords_map.hdf")
         save_coords_map_as_hdf(maps_to_save, out_map)
         logging.info(f"Saved {len(maps_to_save)} coordinate map(s) for file {filename} to {out_map}")
