@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 #
 # Author: Jesus Galaz-Montoya 2025
-# Last modification: Apr/18/2025
-# Performance optimizations: Apr/18/2025
+# Last modification: Apr/20/2025
+# Performance optimizations: Apr/20/2025
 #
 # PERFORMANCE NOTES:
 # - Added extensive memory optimizations to prevent crashes on large datasets
@@ -11,6 +11,9 @@
 # - Added auto-tuning of processing parameters based on available system resources
 # - Added performance_mode parameter with options: 'memory', 'balanced', 'speed'
 # - Default peak_method switched to 'vectorized' for better performance
+# - Added robust process pool error recovery for BrokenProcessPool errors
+# - Added memory monitoring and graceful degradation when memory gets low
+# - Implemented fallback mechanisms for when parallel processing fails
 #
 # CCPEAKS_PLOT
 # ============
@@ -88,6 +91,7 @@ import traceback
 import gc  # For explicit garbage collection
 import math  # For calculating optimal batch sizes
 from mpl_toolkits.mplot3d import Axes3D
+import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from scipy.ndimage import gaussian_filter
@@ -1462,7 +1466,7 @@ def process_all_at_once(input_files, template_file, args, templates, input_image
 
 def batch_process_tasks(all_tasks, batch_size, max_workers):
     """
-    Process tasks in batches to control memory usage.
+    Process tasks in batches to control memory usage with robust failure handling.
     
     Args:
         all_tasks: List of all tasks to process
@@ -1478,9 +1482,9 @@ def batch_process_tasks(all_tasks, batch_size, max_workers):
     available_memory = psutil.virtual_memory().available / (1024 * 1024)  # MB
     system_memory = psutil.virtual_memory().total / (1024 * 1024)  # MB
     
-    # Safer batch size calculation - use 60% of available memory as a limit
-    # and ensure each worker gets at least some tasks
-    max_memory_usage = min(available_memory * 0.6, system_memory * 0.4)
+    # More conservative memory limit - use at most 50% of available memory
+    # This leaves more headroom for system and other processes
+    max_memory_usage = min(available_memory * 0.5, system_memory * 0.3)
     
     # Estimate average task memory requirement from first few tasks
     # Assume each task needs memory proportional to the data size
@@ -1495,54 +1499,135 @@ def batch_process_tasks(all_tasks, batch_size, max_workers):
                 image_bytes = image.size * image.itemsize
                 template_bytes = template.size * template.itemsize
                 
-                # Each task needs ~5x the input data size for processing
-                # (input, template, cc_map, temporary arrays, etc.)
-                bytes_per_task = (image_bytes + template_bytes) * 5
+                # Each task needs ~7x the input data size for processing
+                # (input, template, cc_map, FFTs, temporary arrays, etc.)
+                bytes_per_task = (image_bytes + template_bytes) * 7  # Increased from 5x to 7x for safety
                 mb_per_task = bytes_per_task / (1024 * 1024)
                 
                 # Adjust batch size based on actual data size
-                memory_based_batch_size = int(max_memory_usage / (mb_per_task * max_workers))
+                # Be more conservative to avoid memory issues
+                memory_based_batch_size = int(max_memory_usage / (mb_per_task * max(1, max_workers)))
                 
                 if memory_based_batch_size < batch_size:
                     logging.info(f"Adjusting batch size from {batch_size} to {memory_based_batch_size} based on memory constraints")
                     logging.info(f"Estimated memory per task: {mb_per_task:.2f} MB, Available memory: {max_memory_usage:.2f} MB")
                     batch_size = max(1, memory_based_batch_size)
     
-    # Ensure batch size is at least 1 per worker for efficiency
-    batch_size = max(max_workers, batch_size)
+    # Extra conservative - smaller batch size to avoid memory pressure
+    # Start with smaller batches and gradually increase if things are working well
+    batch_size = max(1, min(batch_size, max_workers * 2))
     
     # Cap at a reasonable maximum to prevent unlimited growth with large inputs
-    batch_size = min(batch_size, 500)
+    batch_size = min(batch_size, 100)  # Reduced from 500 to be safer
     
     total_batches = (len(all_tasks) + batch_size - 1) // batch_size
     logging.info(f"Processing {len(all_tasks)} tasks in {total_batches} batches of size {batch_size}")
     
+    # Keep track of failures to handle potential full batch failures
+    consecutive_failures = 0
+    max_consecutive_failures = 3
+    failed_task_indices = set()
+    
     for i in range(0, len(all_tasks), batch_size):
+        # Skip batches with indices past the end of all_tasks
+        if i >= len(all_tasks):
+            break
+            
+        # Get the current batch of tasks
         batch = all_tasks[i:i+batch_size]
         batch_num = i // batch_size + 1
         
+        # Log batch start
         logging.info(f"Processing batch {batch_num}/{total_batches} with {len(batch)} tasks")
         
         # Record memory before batch
         pre_batch_memory = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
         
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_image_template, t) for t in batch]
+        # Use try/except to handle catastrophic failures in ProcessPoolExecutor
+        try:
             batch_results = []
             
-            # Process results as they complete and immediately append to main results
-            # to reduce peak memory usage
-            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Batch {batch_num}/{total_batches}"):
+            # First try parallel processing
+            if max_workers > 1 and consecutive_failures < max_consecutive_failures:
                 try:
-                    result = fut.result()
-                    if result is not None:
-                        batch_results.append(result)
-                except Exception as e:
-                    logging.error(f"Error processing task in batch {batch_num}: {str(e)}")
-                    logging.error(traceback.format_exc())
-        
-        # Append batch results to main results list
-        results.extend(batch_results)
+                    # Use fewer workers if we've had failures
+                    effective_workers = max(1, max_workers - consecutive_failures) 
+                    
+                    # Create a process pool with timeout for worker initialization
+                    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                        # Submit all tasks
+                        futures = [executor.submit(process_image_template, t) for t in batch]
+                        
+                        # Process results as they complete
+                        for fut_idx, fut in enumerate(tqdm(as_completed(futures), total=len(futures), 
+                                                          desc=f"Batch {batch_num}/{total_batches}")):
+                            try:
+                                # Set a timeout to prevent hanging
+                                result = fut.result(timeout=600)  # 10 minute timeout
+                                if result is not None:
+                                    batch_results.append(result)
+                            except concurrent.futures.TimeoutError:
+                                logging.error(f"Task {fut_idx} in batch {batch_num} timed out")
+                            except Exception as e:
+                                logging.error(f"Error processing task {fut_idx} in batch {batch_num}: {str(e)}")
+                                logging.error(traceback.format_exc())
+                    
+                    # If we reach here, parallel processing worked
+                    consecutive_failures = 0
+                    
+                except (concurrent.futures.process.BrokenProcessPool, OSError) as e:
+                    # If ProcessPoolExecutor fails, fall back to sequential processing
+                    logging.error(f"Process pool broken in batch {batch_num}, falling back to sequential processing: {str(e)}")
+                    consecutive_failures += 1
+                    batch_results = []  # Clear any partial results
+                    
+                    # Use sequential processing as fallback
+                    for task_idx, task in enumerate(tqdm(batch, desc=f"Batch {batch_num} (sequential fallback)")):
+                        try:
+                            result = process_image_template(task)
+                            if result is not None:
+                                batch_results.append(result)
+                        except Exception as e:
+                            logging.error(f"Error processing task {task_idx} in sequential fallback: {str(e)}")
+                            logging.error(traceback.format_exc())
+            else:
+                # Sequential processing from the start if workers=1 or too many failures
+                logging.info(f"Using sequential processing for batch {batch_num} (workers={max_workers}, failures={consecutive_failures})")
+                for task_idx, task in enumerate(tqdm(batch, desc=f"Batch {batch_num} (sequential)")):
+                    try:
+                        result = process_image_template(task)
+                        if result is not None:
+                            batch_results.append(result)
+                    except Exception as e:
+                        logging.error(f"Error processing task {task_idx} sequentially: {str(e)}")
+                        logging.error(traceback.format_exc())
+            
+            # Append batch results to main results list
+            results.extend(batch_results)
+            
+            # Log batch success
+            logging.info(f"Successfully processed {len(batch_results)}/{len(batch)} tasks in batch {batch_num}")
+            
+            # If we had a good batch, cautiously increase batch size
+            if len(batch_results) > 0.8 * len(batch) and consecutive_failures == 0:
+                if batch_size < 100:  # Don't go too large
+                    new_batch_size = min(int(batch_size * 1.2), 100)
+                    if new_batch_size > batch_size:
+                        logging.info(f"Increasing batch size from {batch_size} to {new_batch_size} due to good performance")
+                        batch_size = new_batch_size
+            
+        except Exception as e:
+            # Catch any other exceptions at the batch level
+            logging.error(f"Critical error processing batch {batch_num}: {str(e)}")
+            logging.error(traceback.format_exc())
+            consecutive_failures += 1
+            
+            # If too many consecutive failures, reduce batch size dramatically
+            if consecutive_failures >= max_consecutive_failures:
+                new_batch_size = max(1, batch_size // 4)
+                logging.warning(f"Too many consecutive failures. Reducing batch size from {batch_size} to {new_batch_size}")
+                batch_size = new_batch_size
+                consecutive_failures = 0  # Reset counter after taking action
         
         # Force garbage collection between batches
         gc.collect()
@@ -1556,11 +1641,10 @@ def batch_process_tasks(all_tasks, batch_size, max_workers):
         logging.info(f"System available memory: {available_memory:.2f} MB")
         
         # Dynamically adjust batch size if memory usage is too high
-        if post_batch_memory > system_memory * 0.7:
-            new_batch_size = int(batch_size * 0.7)  # Reduce by 30%
-            if new_batch_size < batch_size:
-                logging.warning(f"High memory usage detected ({post_batch_memory:.2f} MB). Reducing batch size from {batch_size} to {new_batch_size}")
-                batch_size = max(max_workers, new_batch_size)
+        if post_batch_memory > system_memory * 0.6 or available_memory < system_memory * 0.2:
+            new_batch_size = max(1, int(batch_size * 0.5))  # Reduce by 50% if memory pressure is high
+            logging.warning(f"High memory usage detected ({post_batch_memory:.2f} MB). Reducing batch size from {batch_size} to {new_batch_size}")
+            batch_size = new_batch_size
         
     return results
 
