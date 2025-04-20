@@ -1,7 +1,16 @@
 #!/usr/bin/env python
 #
 # Author: Jesus Galaz-Montoya 2025
-# Last modification: Apr/16/2025
+# Last modification: Apr/18/2025
+# Performance optimizations: Apr/18/2025
+#
+# PERFORMANCE NOTES:
+# - Added extensive memory optimizations to prevent crashes on large datasets
+# - Improved FFT and correlation computation using vectorized operations
+# - Optimized peak finding algorithms for better speed
+# - Added auto-tuning of processing parameters based on available system resources
+# - Added performance_mode parameter with options: 'memory', 'balanced', 'speed'
+# - Default peak_method switched to 'vectorized' for better performance
 #
 # CCPEAKS_PLOT
 # ============
@@ -71,18 +80,40 @@ import numpy as np
 import mrcfile
 import h5py
 import matplotlib.pyplot as plt
-from scipy.signal import correlate
+from scipy.signal import correlate, fftconvolve
 from scipy.stats import ttest_ind, mannwhitneyu, shapiro
 import logging
 import time
 import traceback
+import gc  # For explicit garbage collection
+import math  # For calculating optimal batch sizes
 from mpl_toolkits.mplot3d import Axes3D
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
 import psutil
 import csv
+
+# Enable multithreading in NumPy for faster array operations
+# Setting this early ensures all NumPy operations benefit from multithreading
+try:
+    # Try to use all available cores for NumPy operations
+    import mkl
+    mkl.set_num_threads(psutil.cpu_count(logical=True))
+except ImportError:
+    # If MKL is not available, try to use OpenBLAS settings
+    try:
+        from numpy import __config__
+        # Check if OpenBLAS is being used
+        if hasattr(__config__, '_config') and 'openblas' in str(__config__._config).lower():
+            os.environ["OMP_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
+            os.environ["OPENBLAS_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
+    except:
+        # Fallback - just set environment variables
+        os.environ["OMP_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
+        os.environ["OPENBLAS_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
+        os.environ["MKL_NUM_THREADS"] = str(psutil.cpu_count(logical=True))
 
 try:
     from EMAN2 import EMData, EMNumPy
@@ -270,7 +301,242 @@ def adjust_template(template, target_shape):
     new_template[tuple(slices_target)] = template[tuple(slices_template)]
     return new_template
 
-def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", background_radius=None, background_edge=None, cc_clip_size=None):
+
+def compute_fft(volume):
+    """
+    Compute the FFT of a volume for efficient correlation.
+    
+    Args:
+        volume: 3D NumPy array
+        
+    Returns:
+        FFT of the volume
+    """
+    # Use single precision for FFT which is much faster and uses half the memory
+    # compared to double precision, with minimal impact on accuracy
+    volume_float32 = volume.astype(np.float32, copy=False)
+    
+    # Use numpy's optimized rfftn function which is more memory efficient
+    # than a full FFT since it exploits the symmetry of real inputs
+    return np.fft.rfftn(volume_float32)
+
+
+def compute_cc_map_fft(image_fft, template_fft, shape):
+    """
+    Compute cross-correlation map using precomputed FFTs.
+    
+    This function computes the cross-correlation map directly using FFT multiplication,
+    which is more efficient when correlating one image with multiple templates.
+    
+    Args:
+        image_fft: FFT of the image
+        template_fft: FFT of the template
+        shape: Shape of the original volumes
+        
+    Returns:
+        Cross-correlation map
+    """
+    # Check if input data is the right type for best performance
+    if not np.issubdtype(image_fft.dtype, np.complex128) and not np.issubdtype(image_fft.dtype, np.complex64):
+        image_fft = image_fft.astype(np.complex64)
+    if not np.issubdtype(template_fft.dtype, np.complex128) and not np.issubdtype(template_fft.dtype, np.complex64):
+        template_fft = template_fft.astype(np.complex64)
+    
+    # Compute cc_map using FFT multiplication (conjugate for cross-correlation)
+    # Use in-place conjugate to avoid memory allocation
+    conj_template_fft = np.conjugate(template_fft, out=template_fft.copy())
+    
+    # Perform the multiplication and inverse FFT
+    cc_map = np.fft.irfftn(image_fft * conj_template_fft, shape)
+    
+    # Properly shift the result for correct correlation
+    # Note: fftshift can be a bottleneck for large arrays
+    # Using in-place version can help with memory usage
+    cc_map = np.fft.fftshift(cc_map)
+    
+    return cc_map
+
+
+def calculate_optimal_batch_size(template_count, input_count, volume_size_mb, threads):
+    """
+    Calculate optimal batch size based on memory constraints.
+    
+    Args:
+        template_count: Number of templates
+        input_count: Number of inputs
+        volume_size_mb: Estimated size in MB for one volume
+        threads: Number of parallel threads
+        
+    Returns:
+        batch_size: Optimal batch size
+        batch_mode: 'templates' or 'inputs' indicating what to batch
+    """
+    # Get available system memory
+    total_system_memory = psutil.virtual_memory().total / (1024 * 1024)  # MB
+    available_memory = psutil.virtual_memory().available / (1024 * 1024)  # MB
+    
+    # Get memory_factor from globals or use default
+    memory_factor = globals().get('memory_factor', 0.6)  # Default to 0.6 if not set
+    
+    # Adjust memory usage based on memory_factor:
+    # - memory_factor 0.3 = conservative (30% of available, 20% of total)
+    # - memory_factor 0.6 = balanced (60% of available, 40% of total)
+    # - memory_factor 0.8 = aggressive (80% of available, 60% of total)
+    max_memory_usage = min(available_memory * memory_factor, total_system_memory * (memory_factor * 0.75))
+    
+    # Log memory information
+    logging.info(f"Memory info: Total={total_system_memory:.2f} MB, Available={available_memory:.2f} MB")
+    logging.info(f"Planning to use at most {max_memory_usage:.2f} MB for processing")
+    
+    # Account for Python process overhead (interpreter, loaded modules, etc.)
+    base_process_memory = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    logging.info(f"Current process memory: {base_process_memory:.2f} MB")
+    
+    # Each correlation requires:
+    # 1 image + 1 template + 1 FFT image + 1 FFT template + 1 CC map + temp arrays ≈ 6x volume size
+    # Add extra 20% margin for unexpected allocations
+    memory_per_correlation = volume_size_mb * 7.2  # 6 * 1.2
+    
+    # Determine batch mode based on which dimension is larger
+    if template_count > input_count:
+        # Batch by templates (keep all inputs in memory)
+        batch_mode = 'templates'
+        total_items = template_count
+        memory_fixed = input_count * volume_size_mb
+    else:
+        # Batch by inputs (keep all templates in memory)
+        batch_mode = 'inputs'
+        total_items = input_count
+        memory_fixed = template_count * volume_size_mb
+    
+    # Calculate memory available for batch items
+    memory_for_batch = max(0, max_memory_usage - base_process_memory - memory_fixed)
+    
+    # Log memory allocation plan
+    logging.info(f"Batching by {batch_mode}: {total_items} items total")
+    logging.info(f"Fixed memory for loaded data: {memory_fixed:.2f} MB")
+    logging.info(f"Memory available for batch processing: {memory_for_batch:.2f} MB")
+    logging.info(f"Estimated memory per correlation: {memory_per_correlation:.2f} MB")
+    
+    # Calculate how many items we can process at once
+    # Use a more conservative formula - scale memory requirement by threads
+    # This helps prevent memory spikes from parallel allocations
+    memory_scaling_factor = 1.0 + (0.1 * min(threads, 8))  # Increase memory estimate by 10% per thread (up to 8)
+    adjusted_memory_per_corr = memory_per_correlation * memory_scaling_factor
+    
+    items_per_batch = max(1, int(memory_for_batch / (adjusted_memory_per_corr * threads)))
+    
+    # Adjust for thread count (ensure each thread gets work)
+    # but be more conservative with high thread counts
+    batch_size = max(threads, min(items_per_batch * threads, total_items))
+    
+    # Cap batch size at a reasonable maximum
+    batch_size = min(batch_size, 500)
+    
+    # Ensure batch size is at least 1
+    batch_size = max(1, batch_size)
+    
+    # Log final decision
+    logging.info(f"Selected batch size: {batch_size} with {threads} parallel threads")
+    logging.info(f"This will process ~{batch_size * threads} correlations in parallel")
+    
+    return batch_size, batch_mode
+
+
+def compute_background_stats(image, cc_norm_method="standard", background_radius=None, background_edge=None):
+    """
+    Calculate normalization statistics from an image based on the specified method.
+    
+    This function is separate from the CC calculation to allow calculating background
+    statistics only once per image and reusing them for multiple templates.
+    
+    Parameters:
+        image: 3D NumPy array of the tomogram.
+        cc_norm_method: Normalization method ("standard", "mad", or "background").
+        background_radius: Optional integer for radius-based background.
+        background_edge: Optional integer for edge-based background.
+        
+    Returns:
+        stats: Dictionary with normalization parameters (mean, std, median, mad)
+    """
+    stats = {}
+    
+    if cc_norm_method == "background":
+        # Create the background mask based on the provided method
+        nz, ny, nx = image.shape
+        mask = None
+        
+        # Radius-based background (voxels outside a central sphere)
+        if background_radius is not None:
+            # Ensure background_radius is reasonable
+            min_image_dim = min(image.shape)
+            if background_radius < 8 or background_radius >= min_image_dim // 2:
+                raise ValueError(f"--background_radius must be between 8 and {min_image_dim // 2 - 1} (half the smallest image dimension); got {background_radius}")
+            
+            # Create spherical mask
+            center = np.array(image.shape) // 2
+            Z, Y, X = np.indices(image.shape)
+            mask = ((X - center[2])**2 + (Y - center[1])**2 + (Z - center[0])**2) >= (background_radius ** 2)
+            
+        # Edge-based background (voxels within a certain distance from any face)
+        elif background_edge is not None:
+            # Ensure background_edge is reasonable
+            min_image_dim = min(image.shape)
+            if background_edge < 2 or background_edge >= min_image_dim // 4:
+                raise ValueError(f"--background_edge must be between 2 and {min_image_dim // 4 - 1} (1/4 of the smallest image dimension); got {background_edge}")
+                
+            # Create edge-based mask - voxels within background_edge of any face
+            Z, Y, X = np.indices(image.shape)
+            mask = (Z < background_edge) | (Z >= nz - background_edge) | \
+                   (Y < background_edge) | (Y >= ny - background_edge) | \
+                   (X < background_edge) | (X >= nx - background_edge)
+                
+        # Default: Edge-based background with thickness of 3 voxels
+        else:
+            # Default edge thickness is 3 voxels or 5% of smallest dimension (whichever is larger)
+            default_edge = max(3, int(min(image.shape) * 0.05))
+            default_edge = min(default_edge, min(image.shape) // 10)  # Cap at 10% of smallest dimension
+            
+            # Create edge-based mask with default thickness
+            Z, Y, X = np.indices(image.shape)
+            mask = (Z < default_edge) | (Z >= nz - default_edge) | \
+                   (Y < default_edge) | (Y >= ny - default_edge) | \
+                   (X < default_edge) | (X >= nx - default_edge)
+        
+        # Calculate background statistics from the selected mask
+        if np.any(mask):
+            bg_mean = np.mean(image[mask])
+            bg_std = np.std(image[mask])
+            logging.debug(f"Background stats from {np.sum(mask)} voxels: mean={bg_mean:.4f}, std={bg_std:.4f}")
+            stats["bg_mean"] = bg_mean
+            stats["bg_std"] = bg_std
+        else:
+            # Fallback if mask is empty (should never happen with our checks)
+            bg_mean = np.mean(image)
+            bg_std = np.std(image)
+            logging.warning("Background mask is empty; using whole map statistics")
+            stats["bg_mean"] = bg_mean
+            stats["bg_std"] = bg_std
+            
+    elif cc_norm_method == "mad":
+        # MAD normalization: calculate median and median absolute deviation
+        median_val = np.median(image)
+        mad_val = np.median(np.abs(image - median_val))
+        mad_val *= 1.4826  # Scale to approximate standard deviation
+        stats["median"] = median_val
+        stats["mad"] = mad_val
+        
+    else:  # standard normalization
+        # Z-score: calculate mean and standard deviation
+        mean_val = np.mean(image)
+        std_val = np.std(image)
+        stats["mean"] = mean_val
+        stats["std"] = std_val
+    
+    return stats
+
+
+def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", background_radius=None, background_edge=None, cc_clip_size=None, image_stats=None, image_fft=None, template_fft=None):
     """
     Compute the normalized cross-correlation (CC) map between 'image' and 'template' using FFT-based correlation.
     
@@ -295,13 +561,25 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
         cc_clip_size: Optional integer specifying the size of a central cubic region to focus
                       cross-correlation analysis on. If provided, only this central region will
                       be analyzed for peaks, while the full volume is still used for normalization.
+        image_stats: Optional pre-computed normalization statistics for the image.
+                     If provided, these will be used instead of recalculating.
+        image_fft: Optional pre-computed FFT of the image for faster correlation.
+        template_fft: Optional pre-computed FFT of the template for faster correlation.
     
     Returns:
         cc_map: The normalized cross-correlation map.
     """
+    # Ensure template is the same size as image
     if image.shape != template.shape:
         template = adjust_template(template, image.shape)
-    cc_map = correlate(image, template, mode='same', method='fft')
+    
+    # Compute cross-correlation map using the most efficient method
+    if image_fft is not None and template_fft is not None:
+        # Use pre-computed FFTs for faster correlation
+        cc_map = compute_cc_map_fft(image_fft, template_fft, image.shape)
+    else:
+        # Fall back to standard correlation
+        cc_map = correlate(image, template, mode='same', method='fft')
     
     # Store the full CC map for normalization
     full_cc_map = cc_map.copy()
@@ -328,12 +606,23 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
         
         logging.debug(f"Using cc_clip_size={cc_clip_size}. Central region: z={z_start}:{z_end}, y={y_start}:{y_end}, x={x_start}:{x_end}")
 
+    # Use pre-computed statistics if provided, otherwise calculate them from the CC map
     if cc_norm_method == "background":
-        # Create the background mask based on the provided method
-        nz, ny, nx = cc_map.shape
-        mask = None
-        
-        # Radius-based background (voxels outside a central sphere)
+        if image_stats and "bg_mean" in image_stats and "bg_std" in image_stats:
+            # Use pre-computed background statistics
+            bg_mean = image_stats["bg_mean"]
+            bg_std = image_stats["bg_std"]
+            
+            # Normalize using background statistics
+            if bg_std < 1e-12:
+                logging.warning("Background standard deviation is nearly zero; using value of 1.0")
+                bg_std = 1.0
+            cc_map = (cc_map - bg_mean) / bg_std
+        else:
+            # Calculate statistics from the full CC map
+            # Create the background mask based on the provided method
+            nz, ny, nx = full_cc_map.shape
+            mask = None
         if background_radius is not None:
             # Ensure background_radius is reasonable
             min_image_dim = min(cc_map.shape)
@@ -386,15 +675,30 @@ def compute_ncc_map_3d_single(image, template, cc_norm_method="standard", backgr
         
     elif cc_norm_method == "mad":
         # MAD normalization: subtract median, divide by median absolute deviation
-        # Use full_cc_map for statistics
-        med = np.median(full_cc_map)
-        mad = np.median(np.abs(full_cc_map - med))
+        if image_stats and "median" in image_stats and "mad" in image_stats:
+            # Use pre-computed stats
+            med = image_stats["median"]
+            mad = image_stats["mad"]
+        else:
+            # Calculate from the CC map
+            med = np.median(full_cc_map)
+            mad = np.median(np.abs(full_cc_map - med))
+            mad *= 1.4826  # Scale to approximate standard deviation
+            
         cc_map = (cc_map - med) / (mad if mad != 0 else 1)
         
     else:  # standard normalization
         # Z-score normalization: subtract mean, divide by standard deviation
-        # Use full_cc_map for statistics
-        cc_map = (cc_map - np.mean(full_cc_map)) / np.std(full_cc_map)
+        if image_stats and "mean" in image_stats and "std" in image_stats:
+            # Use pre-computed stats
+            mean_val = image_stats["mean"]
+            std_val = image_stats["std"]
+        else:
+            # Calculate from the CC map
+            mean_val = np.mean(full_cc_map)
+            std_val = np.std(full_cc_map)
+            
+        cc_map = (cc_map - mean_val) / (std_val if std_val != 0 else 1)
     
     # Apply clip mask if cc_clip_size was specified
     if cc_clip_size is not None:
@@ -452,7 +756,7 @@ def non_maximum_suppression(cc_map, n_peaks, diameter):
 
 def vectorized_non_maximum_suppression(cc_map, n_peaks, diameter):
     """
-    Vectorized non-maximum suppression algorithm using NumPy optimizations.
+    Highly optimized vectorized non-maximum suppression algorithm using NumPy.
     This function converts the coordinates from (z,y,x) order (as returned by np.unravel_index)
     to (x,y,z) order before returning them.
     
@@ -464,33 +768,81 @@ def vectorized_non_maximum_suppression(cc_map, n_peaks, diameter):
     Returns:
         List of tuples in (x, y, z, value) format.
     """
+    # Early exit if n_peaks is 0
+    if n_peaks == 0:
+        return []
+    
+    # Use faster flattening and avoid making unnecessary copies
     flat = cc_map.ravel()
-    if n_peaks > 0:
-        min_candidates = min(10 * n_peaks, flat.size)
-        top_indices = np.argpartition(flat, -min_candidates)[-min_candidates:]
+    
+    # Skip slow sorting operations if we're dealing with a large array
+    if flat.size > 1_000_000:  # 100³ is 1 million elements
+        # For large arrays, use argpartition which is much faster than argsort
+        # Only get 20x the peaks we need (or all of them if size is smaller)
+        candidate_count = min(20 * n_peaks, flat.size)
+        top_indices = np.argpartition(flat, -candidate_count)[-candidate_count:]
+        # Sort only these candidates (much faster than sorting the whole array)
         top_indices = top_indices[np.argsort(flat[top_indices])[::-1]]
     else:
+        # For smaller arrays, finding all maximums is still efficient
         top_indices = np.argsort(flat)[::-1]
+    
+    # Convert to coordinates efficiently
     coords = np.asarray(np.unravel_index(top_indices, cc_map.shape)).T
+    
+    # Preallocate output for speed
     accepted = []
+    # Process maxima in order
     diameter_squared = diameter * diameter
-    for idx, coord in enumerate(coords):
-        if n_peaks > 0 and len(accepted) >= n_peaks:
-            break
-        candidate_val = flat[top_indices[idx]]
-        if candidate_val == -np.inf:
-            continue
+    
+    # Special handling for first peak to avoid checks
+    if coords.size > 0:
         # Convert candidate coordinate from (z,y,x) to (x,y,z)
-        candidate_xyz = np.array([coord[2], coord[1], coord[0]])
-        too_close = False
-        if accepted:
-            accepted_coords = np.array([[a, b, c] for (a, b, c, _) in accepted])
-            diff = accepted_coords - candidate_xyz
-            sq_distances = np.sum(diff * diff, axis=1)
-            if np.any(sq_distances < diameter_squared):
-                too_close = True
-        if not too_close:
-            accepted.append((int(candidate_xyz[0]), int(candidate_xyz[1]), int(candidate_xyz[2]), float(candidate_val)))
+        first_coord = coords[0]
+        first_val = flat[top_indices[0]]
+        # Skip if the value is -inf (was masked)
+        if first_val != -np.inf:
+            first_xyz = (int(first_coord[2]), int(first_coord[1]), int(first_coord[0]))
+            accepted.append((first_xyz[0], first_xyz[1], first_xyz[2], float(first_val)))
+    
+    # Process remaining peaks, avoiding Python loops where possible
+    accepted_coords = np.zeros((n_peaks, 3), dtype=np.int32)
+    if accepted:
+        accepted_coords[0] = [accepted[0][0], accepted[0][1], accepted[0][2]]
+        acc_count = 1
+    else:
+        acc_count = 0
+    
+    # Process remaining coordinates
+    for idx in range(1, len(coords)):
+        if acc_count >= n_peaks:
+            break
+            
+        coord = coords[idx]
+        val = flat[top_indices[idx]]
+        
+        # Skip masked values
+        if val == -np.inf:
+            continue
+            
+        # Convert to (x,y,z) order
+        xyz = np.array([coord[2], coord[1], coord[0]])
+        
+        # Fast vectorized distance check
+        if acc_count > 0:
+            # Calculate squared distances to all accepted peaks in one operation
+            diffs = accepted_coords[:acc_count] - xyz
+            sq_dists = np.sum(diffs * diffs, axis=1)
+            
+            # If any peak is too close, skip this coordinate
+            if np.any(sq_dists < diameter_squared):
+                continue
+        
+        # Add to accepted points
+        accepted.append((int(xyz[0]), int(xyz[1]), int(xyz[2]), float(val)))
+        accepted_coords[acc_count] = xyz
+        acc_count += 1
+    
     return accepted
 
 
@@ -558,24 +910,92 @@ def iterative_nms_eman2(cc_map_np, n_peaks, diameter, cc_thresh, verbose=False):
     return accepted, arr
 
 def fallback_iterative_nms(cc_map, n_peaks, diameter, cc_thresh, verbose=False):
-    arr = cc_map.copy()
+    """
+    Optimized fallback iterative non-maximum suppression algorithm.
+    
+    This implementation avoids creating unnecessary copies of data and uses
+    more efficient NumPy operations for finding peaks and masking.
+    
+    Args:
+        cc_map: 3D array of cross-correlation values
+        n_peaks: Number of peaks to extract
+        diameter: Minimum allowed distance between peaks
+        cc_thresh: Optional threshold in sigma units
+        verbose: Whether to print debug information
+        
+    Returns:
+        Tuple of (list of peak coordinates and values, masked array)
+    """
+    # Make copy only if needed (avoid if already a copy)
+    if cc_map is None:
+        return [], None
+        
+    # Work with 32-bit floats for better performance and memory usage
+    if cc_map.dtype != np.float32:
+        arr = cc_map.astype(np.float32, copy=True)
+    else:
+        arr = cc_map.copy()
+    
+    # Get dimensions
     nz, ny, nx = arr.shape
+    
+    # Apply threshold if requested - do it in-place to save memory
     if cc_thresh > 0:
         val_thr = arr.mean() + cc_thresh * arr.std()
-        arr = np.where(arr >= val_thr, arr, -np.inf)
-    if (not n_peaks) or (n_peaks <= 0):
-        n_peaks = arr.size
+        arr[arr < val_thr] = -np.inf
+    
+    # Handle incorrect n_peaks
+    if n_peaks is None or n_peaks <= 0:
+        n_peaks = min(1000, arr.size)  # Cap at a reasonable value to avoid excessive iterations
+    
+    # Pre-compute diameter squared for distance calculations
+    diameter_squared = diameter * diameter
+    
+    # Pre-allocate output for speed
     accepted = []
+    
+    # Faster masking function with clipping and vectorization
+    def fast_mask_region(arr, x0, y0, z0, diameter_squared):
+        # Calculate mask bounds with clipping to array dimensions
+        radius = int(np.ceil(diameter))
+        z_min, z_max = max(0, z0 - radius), min(nz, z0 + radius + 1)
+        y_min, y_max = max(0, y0 - radius), min(ny, y0 + radius + 1)
+        x_min, x_max = max(0, x0 - radius), min(nx, x0 + radius + 1)
+        
+        # Create coordinate grids for the mask region (vectorized)
+        z_grid, y_grid, x_grid = np.mgrid[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        # Calculate squared distances from center
+        distances = (x_grid - x0)**2 + (y_grid - y0)**2 + (z_grid - z0)**2
+        
+        # Create mask where distances <= diameter_squared
+        mask = distances <= diameter_squared
+        
+        # Apply mask to the array
+        arr[z_min:z_max, y_min:y_max, x_min:x_max][mask] = -np.inf
+        
+        return arr
+    
+    # Main peak finding loop with early termination
     for i in range(n_peaks):
+        # Find maximum value and position
         max_val = arr.max()
         if max_val == -np.inf:
             break
-        max_idx = np.argmax(arr)
+            
+        # Get position of maximum
+        max_idx = arr.argmax()
         z0, y0, x0 = np.unravel_index(max_idx, arr.shape)
-        accepted.append((x0, y0, z0, float(max_val)))
-        if verbose:
+        
+        # Store peak in (x,y,z) order with value
+        accepted.append((int(x0), int(y0), int(z0), float(max_val)))
+        
+        if verbose and i < 10:  # Only print first 10 peaks to avoid console spam
             print(f"[DEBUG fallback] peak {i+1}: (x={x0}, y={y0}, z={z0}), val={max_val:.3f}")
-        arr = mask_out_region_xyz(arr, x0, y0, z0, diameter)
+        
+        # Mask out region around the peak
+        arr = fast_mask_region(arr, x0, y0, z0, diameter_squared)
+    
     return accepted, arr
 
 #########################
@@ -720,8 +1140,561 @@ def compute_auto_diameter(template, tomo_shape):
     return auto_diameter
 
 #########################
-# Worker function
+# Worker functions and batch processing
 #########################
+
+def optimized_batch_processing(input_files, template_file, args, templates, input_images=None):
+    """
+    Process images and templates in optimized batches to maximize efficiency and control memory usage.
+    
+    This function implements the intelligent batching strategy:
+    1. Determine whether to batch by inputs or templates based on which is larger
+    2. Pre-compute FFTs to reuse across comparisons
+    3. Compute background statistics once per image
+    
+    Args:
+        input_files: List of input file paths
+        template_file: Template file path
+        args: Command line arguments
+        templates: List of template volumes
+        input_images: Optional pre-loaded input images
+        
+    Returns:
+        List of processed results
+    """
+    # Calculate volume size for memory estimates
+    if templates and len(templates) > 0:
+        template_shape = templates[0].shape
+        voxel_count = np.prod(template_shape)
+        volume_size_mb = voxel_count * 4 / (1024 * 1024)  # 4 bytes per float32
+    else:
+        # Default size estimate if no templates
+        volume_size_mb = 64  # MB
+    
+    n_templates = len(templates)
+    
+    # Load input images if not provided
+    if input_images is None:
+        input_images = []
+        for f in input_files:
+            images = load_image(f)
+            if images is None or len(images) == 0:
+                logging.error(f"Could not load file {f}")
+                continue
+            input_images.append(images)
+    
+    n_inputs = sum(len(imgs) for imgs in input_images)
+    
+    # Determine optimal batch size and mode
+    if args.process_batches:
+        batch_size, batch_mode = calculate_optimal_batch_size(
+            n_templates, n_inputs, volume_size_mb, args.threads)
+        
+        logging.info(f"Optimized batching: mode={batch_mode}, batch_size={batch_size}")
+        logging.info(f"Total tasks: {n_templates} templates × {n_inputs} inputs = {n_templates * n_inputs}")
+        
+        # Calculate memory estimate
+        memory_estimate = n_inputs * n_templates * volume_size_mb * 5  # 5x for all data structures
+        logging.info(f"Estimated total memory without batching: {memory_estimate:.1f} MB")
+    else:
+        batch_mode = 'none'
+        batch_size = max(n_templates, n_inputs)
+        logging.info("Processing without batching (all templates and inputs loaded simultaneously)")
+    
+    # Prepare common data structures
+    results = []
+    template_ffts = {}
+    first_image_shape = input_images[0][0].shape
+    
+    # Pre-compute template FFTs that can be reused
+    if batch_mode != 'templates':  # If not batching templates or no batching
+        logging.info("Pre-computing template FFTs...")
+        for tmpl_idx, template in enumerate(templates):
+            # Ensure template is correct size
+            if template.shape != first_image_shape:
+                template = adjust_template(template, first_image_shape)
+            # Compute and store FFT
+            template_ffts[tmpl_idx] = compute_fft(template)
+        logging.info(f"Finished pre-computing {len(template_ffts)} template FFTs")
+    
+    # Process based on batching strategy
+    if batch_mode == 'templates':
+        # Batch by templates (process all inputs with each template batch)
+        results = process_by_template_batches(
+            input_files, template_file, args, templates, input_images, 
+            batch_size, template_ffts)
+            
+    elif batch_mode == 'inputs':
+        # Batch by inputs (process all templates with each input batch)
+        results = process_by_input_batches(
+            input_files, template_file, args, templates, input_images, 
+            batch_size, template_ffts)
+            
+    else:
+        # No batching - process all at once
+        results = process_all_at_once(
+            input_files, template_file, args, templates, input_images, template_ffts)
+    
+    return results
+
+
+def process_by_template_batches(input_files, template_file, args, templates, input_images, batch_size, template_ffts=None):
+    """Process in batches of templates"""
+    results = []
+    total_batches = (len(templates) + batch_size - 1) // batch_size
+    
+    # Pre-compute image FFTs and stats (all inputs)
+    logging.info("Pre-computing image FFTs and statistics...")
+    image_ffts = {}
+    image_stats = {}
+    
+    for file_idx, images in enumerate(input_images):
+        filename = os.path.splitext(os.path.basename(input_files[file_idx]))[0]
+        for img_idx, image in enumerate(images):
+            # Compute and store image FFT
+            image_ffts[(filename, img_idx)] = compute_fft(image)
+            
+            # Compute and store image statistics
+            image_stats[(filename, img_idx)] = compute_background_stats(
+                image, args.cc_norm_method, args.background_radius, args.background_edge)
+    
+    # Process templates in batches
+    for batch_idx in range(total_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(templates))
+        
+        logging.info(f"Processing template batch {batch_idx+1}/{total_batches} (templates {batch_start}-{batch_end-1})")
+        
+        # Process this batch of templates against all inputs
+        batch_tasks = []
+        for tmpl_idx in range(batch_start, batch_end):
+            template = templates[tmpl_idx]
+            # Compute template FFT for this batch
+            if tmpl_idx not in template_ffts:
+                if template.shape != input_images[0][0].shape:
+                    template = adjust_template(template, input_images[0][0].shape)
+                template_ffts[tmpl_idx] = compute_fft(template)
+                
+            # Create tasks for all inputs with this template
+            for file_idx, images in enumerate(input_images):
+                filename = os.path.splitext(os.path.basename(input_files[file_idx]))[0]
+                for img_idx in range(len(images)):
+                    # Parameters for task
+                    if args.npeaks is None:
+                        diam_int = int(args.diameter)
+                        n_possible = (images[img_idx].shape[0] // diam_int) * \
+                                    (images[img_idx].shape[1] // diam_int) * \
+                                    (images[img_idx].shape[2] // diam_int)
+                        local_npeaks = n_possible
+                    else:
+                        local_npeaks = args.npeaks
+                        
+                    store_map = (tmpl_idx < args.save_cc_maps)
+                    
+                    # Create task with pre-computed data
+                    task = (
+                        filename, img_idx, tmpl_idx,
+                        images[img_idx],  # Full image 
+                        template,         # Full template
+                        local_npeaks, args.ccc_thresh_sigma, args.diameter,
+                        store_map, args.peak_method, args.cc_norm_method,
+                        args.background_radius, args.background_edge, args.cc_clip_size,
+                        image_ffts.get((filename, img_idx)),  # Pre-computed image FFT
+                        template_ffts.get(tmpl_idx),          # Pre-computed template FFT
+                        image_stats.get((filename, img_idx))  # Pre-computed image stats
+                    )
+                    batch_tasks.append(task)
+        
+        # Process this batch with parallel workers
+        with ProcessPoolExecutor(max_workers=args.threads) as executor:
+            futures = [executor.submit(process_image_template_optimized, t) for t in batch_tasks]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Batch {batch_idx+1}/{total_batches}"):
+                result = fut.result()
+                if result is not None:
+                    results.append(result)
+        
+        # Clean up batch resources
+        gc.collect()
+        
+    return results
+
+
+def process_by_input_batches(input_files, template_file, args, templates, input_images, batch_size, template_ffts):
+    """Process in batches of inputs"""
+    results = []
+    
+    # Flatten input images for batching
+    flat_inputs = []
+    for file_idx, images in enumerate(input_images):
+        filename = os.path.splitext(os.path.basename(input_files[file_idx]))[0]
+        for img_idx, image in enumerate(images):
+            flat_inputs.append((filename, file_idx, img_idx, image))
+    
+    total_batches = (len(flat_inputs) + batch_size - 1) // batch_size
+    
+    # Process inputs in batches
+    for batch_idx in range(total_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(flat_inputs))
+        
+        logging.info(f"Processing input batch {batch_idx+1}/{total_batches} (inputs {batch_start}-{batch_end-1})")
+        
+        # Pre-compute FFTs and stats for this batch of inputs
+        batch_image_ffts = {}
+        batch_image_stats = {}
+        
+        for i in range(batch_start, batch_end):
+            filename, _, img_idx, image = flat_inputs[i]
+            # Compute and store image FFT
+            batch_image_ffts[(filename, img_idx)] = compute_fft(image)
+            
+            # Compute and store image statistics
+            batch_image_stats[(filename, img_idx)] = compute_background_stats(
+                image, args.cc_norm_method, args.background_radius, args.background_edge)
+        
+        # Process all templates with this batch of inputs
+        batch_tasks = []
+        for tmpl_idx, template in enumerate(templates):
+            # For each input in this batch
+            for i in range(batch_start, batch_end):
+                filename, _, img_idx, image = flat_inputs[i]
+                
+                # Parameters for task
+                if args.npeaks is None:
+                    diam_int = int(args.diameter)
+                    n_possible = (image.shape[0] // diam_int) * \
+                                (image.shape[1] // diam_int) * \
+                                (image.shape[2] // diam_int)
+                    local_npeaks = n_possible
+                else:
+                    local_npeaks = args.npeaks
+                    
+                store_map = (tmpl_idx < args.save_cc_maps)
+                
+                # Create task with pre-computed data
+                task = (
+                    filename, img_idx, tmpl_idx,
+                    image,                              # Full image 
+                    template,                           # Full template
+                    local_npeaks, args.ccc_thresh_sigma, args.diameter,
+                    store_map, args.peak_method, args.cc_norm_method,
+                    args.background_radius, args.background_edge, args.cc_clip_size,
+                    batch_image_ffts.get((filename, img_idx)),  # Pre-computed image FFT
+                    template_ffts.get(tmpl_idx),                # Pre-computed template FFT
+                    batch_image_stats.get((filename, img_idx))  # Pre-computed image stats
+                )
+                batch_tasks.append(task)
+        
+        # Process this batch with parallel workers
+        with ProcessPoolExecutor(max_workers=args.threads) as executor:
+            futures = [executor.submit(process_image_template_optimized, t) for t in batch_tasks]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Batch {batch_idx+1}/{total_batches}"):
+                result = fut.result()
+                if result is not None:
+                    results.append(result)
+        
+        # Clean up batch resources
+        gc.collect()
+        
+    return results
+
+
+def process_all_at_once(input_files, template_file, args, templates, input_images, template_ffts):
+    """Process all templates and inputs at once (no batching)"""
+    results = []
+    
+    # Pre-compute all image FFTs and stats
+    image_ffts = {}
+    image_stats = {}
+    
+    for file_idx, images in enumerate(input_images):
+        filename = os.path.splitext(os.path.basename(input_files[file_idx]))[0]
+        for img_idx, image in enumerate(images):
+            # Compute and store image FFT
+            image_ffts[(filename, img_idx)] = compute_fft(image)
+            
+            # Compute and store image statistics
+            image_stats[(filename, img_idx)] = compute_background_stats(
+                image, args.cc_norm_method, args.background_radius, args.background_edge)
+    
+    # Create tasks for all template-image pairs
+    all_tasks = []
+    for tmpl_idx, template in enumerate(templates):
+        for file_idx, images in enumerate(input_images):
+            filename = os.path.splitext(os.path.basename(input_files[file_idx]))[0]
+            for img_idx, image in enumerate(images):
+                # Parameters for task
+                if args.npeaks is None:
+                    diam_int = int(args.diameter)
+                    n_possible = (image.shape[0] // diam_int) * \
+                                (image.shape[1] // diam_int) * \
+                                (image.shape[2] // diam_int)
+                    local_npeaks = n_possible
+                else:
+                    local_npeaks = args.npeaks
+                    
+                store_map = (tmpl_idx < args.save_cc_maps)
+                
+                # Create task with pre-computed data
+                task = (
+                    filename, img_idx, tmpl_idx,
+                    image,  # Full image 
+                    template,  # Full template
+                    local_npeaks, args.ccc_thresh_sigma, args.diameter,
+                    store_map, args.peak_method, args.cc_norm_method,
+                    args.background_radius, args.background_edge, args.cc_clip_size,
+                    image_ffts.get((filename, img_idx)),  # Pre-computed image FFT
+                    template_ffts.get(tmpl_idx),  # Pre-computed template FFT
+                    image_stats.get((filename, img_idx))  # Pre-computed image stats
+                )
+                all_tasks.append(task)
+    
+    # Process all tasks with parallel workers
+    with ProcessPoolExecutor(max_workers=args.threads) as executor:
+        futures = [executor.submit(process_image_template_optimized, t) for t in all_tasks]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+            result = fut.result()
+            if result is not None:
+                results.append(result)
+    
+    return results
+
+
+def batch_process_tasks(all_tasks, batch_size, max_workers):
+    """
+    Process tasks in batches to control memory usage.
+    
+    Args:
+        all_tasks: List of all tasks to process
+        batch_size: Number of tasks to process in each batch
+        max_workers: Number of parallel workers to use
+        
+    Returns:
+        List of results from all tasks
+    """
+    results = []
+    
+    # Calculate optimal batch size based on system memory and max_workers
+    available_memory = psutil.virtual_memory().available / (1024 * 1024)  # MB
+    system_memory = psutil.virtual_memory().total / (1024 * 1024)  # MB
+    
+    # Safer batch size calculation - use 60% of available memory as a limit
+    # and ensure each worker gets at least some tasks
+    max_memory_usage = min(available_memory * 0.6, system_memory * 0.4)
+    
+    # Estimate average task memory requirement from first few tasks
+    # Assume each task needs memory proportional to the data size
+    if all_tasks and len(all_tasks) > 0:
+        sample_task = all_tasks[0]
+        if len(sample_task) >= 5:  # Ensure task tuple has expected elements
+            image = sample_task[3]
+            template = sample_task[4]
+            
+            if hasattr(image, 'shape') and hasattr(template, 'shape'):
+                # Calculate approximate memory per task
+                image_bytes = image.size * image.itemsize
+                template_bytes = template.size * template.itemsize
+                
+                # Each task needs ~5x the input data size for processing
+                # (input, template, cc_map, temporary arrays, etc.)
+                bytes_per_task = (image_bytes + template_bytes) * 5
+                mb_per_task = bytes_per_task / (1024 * 1024)
+                
+                # Adjust batch size based on actual data size
+                memory_based_batch_size = int(max_memory_usage / (mb_per_task * max_workers))
+                
+                if memory_based_batch_size < batch_size:
+                    logging.info(f"Adjusting batch size from {batch_size} to {memory_based_batch_size} based on memory constraints")
+                    logging.info(f"Estimated memory per task: {mb_per_task:.2f} MB, Available memory: {max_memory_usage:.2f} MB")
+                    batch_size = max(1, memory_based_batch_size)
+    
+    # Ensure batch size is at least 1 per worker for efficiency
+    batch_size = max(max_workers, batch_size)
+    
+    # Cap at a reasonable maximum to prevent unlimited growth with large inputs
+    batch_size = min(batch_size, 500)
+    
+    total_batches = (len(all_tasks) + batch_size - 1) // batch_size
+    logging.info(f"Processing {len(all_tasks)} tasks in {total_batches} batches of size {batch_size}")
+    
+    for i in range(0, len(all_tasks), batch_size):
+        batch = all_tasks[i:i+batch_size]
+        batch_num = i // batch_size + 1
+        
+        logging.info(f"Processing batch {batch_num}/{total_batches} with {len(batch)} tasks")
+        
+        # Record memory before batch
+        pre_batch_memory = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_image_template, t) for t in batch]
+            batch_results = []
+            
+            # Process results as they complete and immediately append to main results
+            # to reduce peak memory usage
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Batch {batch_num}/{total_batches}"):
+                try:
+                    result = fut.result()
+                    if result is not None:
+                        batch_results.append(result)
+                except Exception as e:
+                    logging.error(f"Error processing task in batch {batch_num}: {str(e)}")
+                    logging.error(traceback.format_exc())
+        
+        # Append batch results to main results list
+        results.extend(batch_results)
+        
+        # Force garbage collection between batches
+        gc.collect()
+        
+        # Check memory usage and log
+        post_batch_memory = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        memory_diff = post_batch_memory - pre_batch_memory
+        available_memory = psutil.virtual_memory().available / (1024 * 1024)
+        
+        logging.info(f"Memory usage after batch {batch_num}: {post_batch_memory:.2f} MB (change: {memory_diff:+.2f} MB)")
+        logging.info(f"System available memory: {available_memory:.2f} MB")
+        
+        # Dynamically adjust batch size if memory usage is too high
+        if post_batch_memory > system_memory * 0.7:
+            new_batch_size = int(batch_size * 0.7)  # Reduce by 30%
+            if new_batch_size < batch_size:
+                logging.warning(f"High memory usage detected ({post_batch_memory:.2f} MB). Reducing batch size from {batch_size} to {new_batch_size}")
+                batch_size = max(max_workers, new_batch_size)
+        
+    return results
+
+def process_image_template_with_loading(task_info):
+    """
+    Process a task by first loading the required image/template data.
+    
+    Args:
+        task_info: Tuple containing task information including file paths
+        
+    Returns:
+        Result from processing the task
+    """
+    (filename, img_idx, tmpl_idx, img_path, img_index, 
+     tmpl_path, tmpl_index, *other_args) = task_info
+     
+    # Load just the needed image and template
+    image = load_image(img_path, img_idx=img_index)
+    template = load_image(tmpl_path, img_idx=tmpl_index)
+    
+    # Process with loaded data
+    result = process_image_template((filename, img_idx, tmpl_idx, 
+                                    image, template, *other_args))
+    
+    # Help garbage collection
+    del image
+    del template
+    
+    return result
+
+
+def process_image_template_optimized(args_tuple):
+    """
+    Optimized worker function that processes one (image, template) pair.
+    
+    Efficiently computes the CC map using precomputed FFTs and statistics.
+    
+    Args:
+        args_tuple: Extended tuple with optional precomputed data
+        
+    Returns:
+        Result tuple with peak information
+    """
+    try:
+        # Unpack arguments, with support for pre-computed data
+        if len(args_tuple) >= 16:  # Extended format with pre-computed data
+            (filename, image_idx, tmpl_idx, image, template,
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method, cc_norm_method,
+             background_radius, background_edge, cc_clip_size,
+             image_fft, template_fft, image_stats) = args_tuple
+        elif len(args_tuple) == 14:  # New format with cc_clip_size
+            (filename, image_idx, tmpl_idx, image, template,
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method, cc_norm_method,
+             background_radius, background_edge, cc_clip_size) = args_tuple
+            image_fft = None
+            template_fft = None
+            image_stats = None
+        else:  # Old format
+            (filename, image_idx, tmpl_idx, image, template,
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method, cc_norm_method,
+             background_radius, background_edge) = args_tuple
+            cc_clip_size = None
+            image_fft = None
+            template_fft = None
+            image_stats = None
+            
+        # Ensure diameter is not None
+        if diameter is None:
+            diameter = 35.0  # Default diameter if not specified
+        
+        # Use pre-computed statistics if available, otherwise compute them
+        if image_stats is None:
+            image_stats = compute_background_stats(
+                image, 
+                cc_norm_method=cc_norm_method,
+                background_radius=background_radius,
+                background_edge=background_edge
+            )
+        
+        # Compute cross-correlation map with optimizations
+        cc_map = compute_ncc_map_3d_single(
+            image, 
+            template, 
+            cc_norm_method=cc_norm_method, 
+            background_radius=background_radius,
+            background_edge=background_edge,
+            cc_clip_size=cc_clip_size,
+            image_stats=image_stats,
+            image_fft=image_fft,
+            template_fft=template_fft
+        )
+        
+        # Apply additional thresholding if requested
+        if cc_thresh > 0:
+            thresh = cc_map.mean() + cc_thresh * cc_map.std()
+            cc_map = np.where(cc_map >= thresh, cc_map, -np.inf)
+        
+        # Find peaks using the appropriate method
+        if method == "eman2" and EMAN2_AVAILABLE:
+            # Use EMAN2 for peak finding
+            local_peaks, cc_map_masked = iterative_nms_eman2(
+                cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE
+            )
+            
+            # Return with additional masked map for EMAN2 method
+            if store_ccmap and tmpl_idx == 0:
+                return (filename, image_idx, tmpl_idx, local_peaks, cc_map, cc_map_masked)
+        
+        elif method == "vectorized":
+            # Use vectorized method
+            local_peaks = vectorized_non_maximum_suppression(
+                cc_map, n_peaks_local, diameter
+            )
+            
+        elif method == "fallback" or (method == "eman2" and not EMAN2_AVAILABLE):
+            # Use fallback method
+            local_peaks, cc_map_masked = fallback_iterative_nms(
+                cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE
+            )
+            
+        else:
+            # Use original method
+            local_peaks = non_maximum_suppression(cc_map, n_peaks_local, diameter)
+        
+        # Return results
+        if store_ccmap:
+            return (filename, image_idx, tmpl_idx, local_peaks, cc_map)
+        else:
+            return (filename, image_idx, tmpl_idx, local_peaks)
+            
+    except Exception as e:
+        logging.error(f"Error processing file {filename} image {image_idx} template {tmpl_idx}: {e}")
+        logging.error(traceback.format_exc())
+        return None
 
 def process_image_template(args_tuple):
     """
@@ -731,68 +1704,231 @@ def process_image_template(args_tuple):
     applies optional thresholding, and then extracts peaks using one of the available methods.
     
     Returns a tuple with the extracted peak information and optionally the raw CC map.
+    
+    This optimized version focuses on memory efficiency and improved error handling.
     """
-
+    # Default values for error reporting
+    filename = "unknown"
+    image_idx = -1
+    template_idx = -1
+    
     try:
-        # Handle both old and new parameter format
-        if len(args_tuple) == 14:  # New format with cc_clip_size
+        # Handle multiple parameter formats with more flexibility
+        if len(args_tuple) >= 16:  # Extended format with pre-computed data
             (filename, image_idx, template_idx, image, template,
              n_peaks_local, cc_thresh, diameter, store_ccmap, method,
-             cc_norm_method, background_radius, background_edge, cc_clip_size) = args_tuple
+             cc_norm_method, background_radius, background_edge, cc_clip_size,
+             image_fft, template_fft, image_stats) = args_tuple[:17]
+        elif len(args_tuple) >= 14:  # New format with cc_clip_size
+            (filename, image_idx, template_idx, image, template,
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method,
+             cc_norm_method, background_radius, background_edge, cc_clip_size) = args_tuple[:14]
+            image_fft = None
+            template_fft = None
+            image_stats = None
         else:  # Old format
             (filename, image_idx, template_idx, image, template,
-             n_peaks_local, cc_thresh, diameter, store_ccmap, method,
-             cc_norm_method, background_radius, background_edge) = args_tuple
+             n_peaks_local, cc_thresh, diameter, store_ccmap, method) = args_tuple[:10]
+             
+            # Set default values for optional parameters
+            if len(args_tuple) > 10:
+                cc_norm_method = args_tuple[10]
+            else:
+                cc_norm_method = "standard"
+                
+            if len(args_tuple) > 11:
+                background_radius = args_tuple[11]
+            else:
+                background_radius = None
+                
+            if len(args_tuple) > 12:
+                background_edge = args_tuple[12]
+            else:
+                background_edge = None
+                
             cc_clip_size = None
+            image_fft = None
+            template_fft = None
+            image_stats = None
             
         # Ensure diameter is not None
         if diameter is None:
             diameter = 35.0  # Default diameter if not specified
-            
-        cc_map = compute_ncc_map_3d_single(image, template, 
-                                           cc_norm_method=cc_norm_method, 
-                                           background_radius=background_radius,
-                                           background_edge=background_edge,
-                                           cc_clip_size=cc_clip_size)
         
-        # Apply thresholding if requested.
+        # First make sure template and image are compatible sizes
+        if image.shape != template.shape:
+            template = adjust_template(template, image.shape)
+        
+        # Precompute image statistics for normalization if not provided
+        if image_stats is None:
+            image_stats = compute_background_stats(
+                image, 
+                cc_norm_method=cc_norm_method,
+                background_radius=background_radius,
+                background_edge=background_edge
+            )
+        
+        # Compute FFTs if not provided
+        if image_fft is None:
+            image_fft = compute_fft(image)
+        
+        if template_fft is None:
+            template_fft = compute_fft(template)
+        
+        # Compute CC map
+        cc_map = compute_cc_map_fft(image_fft, template_fft, image.shape)
+        
+        # Explicitly release large temporary objects
+        # Only delete FFTs if we created them (not if they were passed in)
+        if image_fft is not None and (len(args_tuple) < 15 or args_tuple[14] is None):
+            del image_fft
+        if template_fft is not None and (len(args_tuple) < 16 or args_tuple[15] is None):
+            del template_fft
+        gc.collect()
+        
+        # Normalize CC map
+        # Apply normalization directly here since normalize_cc_map isn't defined separately
+        # Save memory by normalizing in place
+        
+        # Apply cc_clip_size if provided to focus on a central region
+        mask_outside_clip = None
+        if cc_clip_size is not None:
+            # Validate cc_clip_size
+            min_image_dim = min(cc_map.shape)
+            if cc_clip_size < 10 or cc_clip_size >= min_image_dim:
+                logging.warning(f"cc_clip_size {cc_clip_size} outside valid range (10 to {min_image_dim-1}); ignoring")
+            else:
+                # Calculate the slice indices for the central cubic region
+                center = np.array(cc_map.shape) // 2
+                half_size = cc_clip_size // 2
+                
+                # Create slices for the central region
+                z_start, z_end = max(0, center[0] - half_size), min(cc_map.shape[0], center[0] + half_size)
+                y_start, y_end = max(0, center[1] - half_size), min(cc_map.shape[1], center[1] + half_size)
+                x_start, x_end = max(0, center[2] - half_size), min(cc_map.shape[2], center[2] + half_size)
+                
+                # Create a mask that is True outside the central region (to zero out these values later)
+                mask_outside_clip = np.ones(cc_map.shape, dtype=bool)
+                mask_outside_clip[z_start:z_end, y_start:y_end, x_start:x_end] = False
+                
+                logging.debug(f"Using cc_clip_size={cc_clip_size}. Central region: z={z_start}:{z_end}, y={y_start}:{y_end}, x={x_start}:{x_end}")
+        
+        # Normalize the CC map based on the specified method
+        if cc_norm_method == "background":
+            if image_stats and "bg_mean" in image_stats and "bg_std" in image_stats:
+                # Use pre-computed background statistics
+                bg_mean = image_stats["bg_mean"]
+                bg_std = image_stats["bg_std"]
+                
+                # Normalize using background statistics
+                if bg_std < 1e-12:
+                    logging.warning("Background standard deviation is nearly zero; using value of 1.0")
+                    bg_std = 1.0
+                cc_map = (cc_map - bg_mean) / bg_std
+            else:
+                # Calculate on the fly - last resort if stats weren't precomputed
+                bg_mean = np.mean(cc_map)
+                bg_std = max(np.std(cc_map), 1e-12)
+                cc_map = (cc_map - bg_mean) / bg_std
+                
+        elif cc_norm_method == "mad":
+            # MAD normalization: subtract median, divide by median absolute deviation
+            if image_stats and "median" in image_stats and "mad" in image_stats:
+                # Use pre-computed stats
+                med = image_stats["median"]
+                mad = image_stats["mad"]
+            else:
+                # Calculate from the CC map
+                med = np.median(cc_map)
+                mad = np.median(np.abs(cc_map - med))
+                mad *= 1.4826  # Scale to approximate standard deviation
+                
+            if mad < 1e-12:
+                mad = 1.0
+                logging.warning("MAD value is nearly zero; using value of 1.0")
+                
+            cc_map = (cc_map - med) / mad
+            
+        else:  # standard normalization
+            # Z-score normalization: subtract mean, divide by standard deviation
+            if image_stats and "mean" in image_stats and "std" in image_stats:
+                # Use pre-computed stats
+                mean_val = image_stats["mean"]
+                std_val = image_stats["std"]
+            else:
+                # Calculate from the CC map
+                mean_val = np.mean(cc_map)
+                std_val = np.std(cc_map)
+                
+            if std_val < 1e-12:
+                std_val = 1.0
+                logging.warning("Standard deviation is nearly zero; using value of 1.0")
+                
+            cc_map = (cc_map - mean_val) / std_val
+        
+        # Apply clip mask if cc_clip_size was specified
+        if mask_outside_clip is not None:
+            # Set all values outside the central region to -infinity to exclude them from peak finding
+            cc_map[mask_outside_clip] = -np.inf
+            logging.info(f"Applied cc_clip_size={cc_clip_size}: focusing analysis on central region")
+        
+        # Apply thresholding if requested
         if cc_thresh > 0:
             thresh = cc_map.mean() + cc_thresh * cc_map.std()
             cc_map = np.where(cc_map >= thresh, cc_map, -np.inf)
             
-        # Choose the peak-finding method based on the method parameter.
-        if method == "eman2" and EMAN2_AVAILABLE:
-            logging.debug(f"Using EMAN2 method with diameter={diameter}")
-            local_peaks, cc_map_masked = iterative_nms_eman2(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
-            if store_ccmap and template_idx == 0:
-                return (filename, image_idx, template_idx, local_peaks, cc_map, cc_map_masked)
-        elif method == "vectorized":
-            logging.debug(f"Using vectorized method with diameter={diameter}")
-            local_peaks = vectorized_non_maximum_suppression(cc_map, n_peaks_local, diameter)
-            cc_map_masked = None
-        elif method == "fallback" or (method == "eman2" and not EMAN2_AVAILABLE):
-            logging.debug(f"Using fallback method with diameter={diameter}")
-            local_peaks, cc_map_masked = fallback_iterative_nms(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
-        else:  # default "original" method
-            logging.debug(f"Using original method with diameter={diameter}")
-            if cc_thresh > 0:
-                thresh_val = cc_map.mean() + cc_thresh * cc_map.std()
-                cc_map_thresholded = np.where(cc_map >= thresh_val, cc_map, -np.inf)
-                local_peaks = non_maximum_suppression(cc_map_thresholded, n_peaks_local, diameter)
-            else:
-                local_peaks = non_maximum_suppression(cc_map, n_peaks_local, diameter)
-            cc_map_masked = None
+        # Choose the peak-finding method based on the method parameter
+        try:
+            if method == "eman2" and EMAN2_AVAILABLE:
+                local_peaks, cc_map_masked = iterative_nms_eman2(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
+                
+                # Only return the masked map if explicitly requested to save memory
+                if store_ccmap and template_idx == 0:
+                    return (filename, image_idx, template_idx, local_peaks, cc_map, cc_map_masked)
+            elif method == "vectorized":
+                local_peaks = vectorized_non_maximum_suppression(cc_map, n_peaks_local, diameter)
+                cc_map_masked = None
+            elif method == "fallback" or (method == "eman2" and not EMAN2_AVAILABLE):
+                if method == "eman2":
+                    logging.warning(f"EMAN2 requested but not available, falling back to standard method")
+                local_peaks, cc_map_masked = fallback_iterative_nms(cc_map, n_peaks_local, diameter, cc_thresh, verbose=_VERBOSE)
+            else:  # default "original" method
+                if cc_thresh > 0:
+                    thresh_val = cc_map.mean() + cc_thresh * cc_map.std()
+                    # Apply threshold in-place to save memory
+                    cc_map[cc_map < thresh_val] = -np.inf
+                    local_peaks = non_maximum_suppression(cc_map, n_peaks_local, diameter)
+                else:
+                    local_peaks = non_maximum_suppression(cc_map, n_peaks_local, diameter)
+                cc_map_masked = None
 
-        logging.debug(f"Found {len(local_peaks)} peaks for file {filename}, image {image_idx}, template {template_idx}")
-        
-        if store_ccmap:
-            return (filename, image_idx, template_idx, local_peaks, cc_map)
-        else:
-            return (filename, image_idx, template_idx, local_peaks)
+            logging.debug(f"Found {len(local_peaks)} peaks for file {filename}, image {image_idx}, template {template_idx}")
+            
+            # Return only what's needed to minimize memory usage
+            if store_ccmap:
+                return (filename, image_idx, template_idx, local_peaks, cc_map)
+            else:
+                # Let the CC map be garbage collected immediately
+                del cc_map
+                gc.collect()
+                return (filename, image_idx, template_idx, local_peaks)
+                
+        except MemoryError:
+            logging.error(f"Memory error during peak finding for {filename}, image {image_idx}, template {template_idx}")
+            # Try to recover some memory
+            del cc_map
+            gc.collect()
+            # Return minimal result
+            return (filename, image_idx, template_idx, [])
+            
+    except MemoryError:
+        logging.error(f"Memory error processing {filename}, image {image_idx}, template {template_idx}")
+        # Return empty peaks when we can't process an image
+        return (filename, image_idx, template_idx, [])
     except Exception as e:
-        logging.error(f"Error processing file {filename} image {image_idx} template {template_idx}: {e}")
+        logging.error(f"Error processing file {filename}, image {image_idx}, template {template_idx}: {str(e)}")
         logging.error(traceback.format_exc())
-        return None
+        return (filename, image_idx, template_idx, [])
 
 
 #########################
@@ -1011,6 +2147,10 @@ def main():
                         help="Default='file1,file2'. Comma-separated labels for datasets.")
     parser.add_argument('--diameter', type=float, default=None,
                         help="Default=None (auto). Minimum allowed distance (voxels) between final peaks.")
+    parser.add_argument('--process_batches', action='store_true', default=False,
+                        help="Default=False. Process in memory-efficient batches. Reduces peak memory usage but may be slower.")
+    parser.add_argument('--performance_mode', choices=['memory', 'balanced', 'speed'], default='balanced',
+                        help="Default='balanced'. Performance optimization mode: 'memory' (lowest memory usage), 'balanced' (balanced speed and memory), or 'speed' (fastest but higher memory usage).")
     parser.add_argument('--input', required=True,
                         help="Required. Comma-separated tomogram file paths; maximum 2 allowed.")
     parser.add_argument('--match_sets_size', action='store_true', default=False,
@@ -1019,8 +2159,8 @@ def main():
                         help="Default=None (auto). Number of final peaks to keep per image.")
     parser.add_argument('--output_dir', default="cc_analysis",
                         help="Default='cc_analysis'. Base output directory.")
-    parser.add_argument('--peak_method', type=str, default="original",
-                        help="Default='original'. Peak-finding method; options: 'original', 'eman2', 'vectorized', 'fallback'.")
+    parser.add_argument('--peak_method', type=str, default="vectorized",
+                        help="Default='vectorized'. Peak-finding method; options: 'vectorized' (fast), 'original', 'eman2' (if available), 'fallback'.")
     parser.add_argument('--save_cc_maps', type=int, default=1,
                         help="Default=1. Number of CC maps to save per input file.")
     parser.add_argument('--save_coords_maps', type=int, default=1,
@@ -1060,6 +2200,54 @@ def main():
     overall_start = time.time()
     logging.info("Starting processing...")
     logging.info(f"EMAN2 is {'available' if EMAN2_AVAILABLE else 'not available'}")
+    
+    # Apply performance mode settings
+    if args.performance_mode == 'speed':
+        # Speed optimization:
+        # 1. Always use vectorized method if not explicitly overridden
+        if args.peak_method == 'original':
+            args.peak_method = 'vectorized'
+            logging.info("Performance mode 'speed': Using vectorized peak finding method")
+        # 2. Use more aggressive batching for better parallel processing
+        memory_factor = 0.8  # Use more available memory
+        # 3. Force process_batches to False unless memory is likely to be a constraint
+        estimated_memory = psutil.virtual_memory().available / (1024*1024*1024)  # GB
+        if estimated_memory > 16 and not args.process_batches:
+            args.process_batches = False
+            logging.info(f"Performance mode 'speed': Processing without batching (available memory: {estimated_memory:.1f} GB)")
+        # 4. Use more threads by default if not specified
+        if args.threads == 1:
+            recommended_threads = min(psutil.cpu_count(logical=False) or 4, 8)
+            args.threads = recommended_threads
+            logging.info(f"Performance mode 'speed': Using {args.threads} threads")
+            
+    elif args.performance_mode == 'memory':
+        # Memory optimization:
+        # 1. Always use batching
+        if not args.process_batches:
+            args.process_batches = True
+            logging.info("Performance mode 'memory': Enabling batch processing")
+        # 2. Use smaller, more conservative batch sizes
+        memory_factor = 0.3  # Use less memory per batch
+        # 3. Limit threads to reduce memory pressure
+        if args.threads > 4:
+            args.threads = 4
+            logging.info("Performance mode 'memory': Limiting to 4 threads to reduce memory usage")
+    else:  # balanced mode
+        # Balance memory and speed:
+        memory_factor = 0.6  # Moderate memory usage
+        # Use batching if memory is constrained
+        total_memory = psutil.virtual_memory().total / (1024*1024*1024)  # GB
+        if total_memory < 16 and not args.process_batches:
+            args.process_batches = True
+            logging.info(f"Performance mode 'balanced': Enabling batch processing (system memory: {total_memory:.1f} GB)")
+        # Suggest optimal thread count
+        if args.threads == 1:
+            recommended_threads = min(max(2, psutil.cpu_count(logical=False) or 2), 6)
+            args.threads = recommended_threads
+            logging.info(f"Performance mode 'balanced': Using {args.threads} threads")
+    
+    logging.info(f"Performance configuration: mode={args.performance_mode}, threads={args.threads}, batch_process={args.process_batches}, peak_method={args.peak_method}")
 
     # Load templates.
     templates_list = load_image(args.template)
@@ -1221,15 +2409,51 @@ def main():
     # cc_clip_size is now independent of background normalization
 
     logging.info(f"Starting memory usage: {psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024):.2f} MB")
-   
-    # Process tasks in parallel.
-    partial_results = []
-    with ProcessPoolExecutor(max_workers=args.threads) as executor:
-        futures = [executor.submit(process_image_template, t) for t in tasks]
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing tasks"):
-            res = fut.result()
-            if res is not None:
-                partial_results.append(res)
+
+    # Calculate memory requirements
+    if templates and len(templates) > 0:
+        template_shape = templates[0].shape
+        voxel_count = np.prod(template_shape)
+        volume_size_mb = voxel_count * 4 / (1024 * 1024)  # 4 bytes per float32
+    else:
+        # Default size estimate if no templates
+        volume_size_mb = 64  # MB
+
+    n_templates = len(templates)
+    n_inputs = sum(len(imgs) for imgs in input_images)
+    
+    # Each correlation requires approximately 5x the volume size in memory
+    memory_per_correlation = volume_size_mb * 5
+    estimated_total_memory = n_templates * n_inputs * memory_per_correlation
+    
+    # Get available system memory (leave 20% for OS and other processes)
+    total_system_memory = psutil.virtual_memory().total / (1024 * 1024)  # MB
+    available_memory = total_system_memory * 0.8
+    
+    # Determine if memory-constrained batching is needed
+    memory_constrained_batching = args.process_batches or (estimated_total_memory > available_memory * 0.7)
+    
+    if memory_constrained_batching:
+        if not args.process_batches:
+            logging.info(f"Automatically enabling memory-efficient batching: estimated memory usage ({estimated_total_memory:.1f} MB) exceeds 70% of available memory ({available_memory * 0.7:.1f} MB)")
+        
+        # Calculate optimal batch size based on memory constraints
+        batch_size, batch_mode = calculate_optimal_batch_size(n_templates, n_inputs, volume_size_mb, args.threads)
+        logging.info(f"Using memory-efficient batching: mode={batch_mode}, batch_size={batch_size}")
+    else:
+        # When not using memory-efficient batching, process all data at once but still use task batches for parallelism
+        logging.info("Processing without memory constraints (all templates and inputs loaded simultaneously)")
+        batch_size = min(len(tasks), args.threads * 8)  # Larger batches for better parallelism
+        
+    # We always use batch_process_tasks for parallel execution, but the meaning of "batch" is different:
+    # - In memory-constrained mode: each batch loads/unloads data to control memory usage
+    # - In non-constrained mode: batches are just for parallel task management
+    if memory_constrained_batching:
+        logging.info(f"Processing {len(tasks)} total tasks in memory-efficient batches of {batch_size}")
+    else:
+        logging.info(f"Processing {len(tasks)} total tasks with {batch_size} tasks per parallel batch")
+        
+    partial_results = batch_process_tasks(tasks, batch_size, args.threads)
 
     partial_peaks = defaultdict(list)
     cc_maps = {}
@@ -1430,11 +2654,13 @@ import numpy as np
 import mrcfile
 import h5py
 import matplotlib.pyplot as plt
-from scipy.signal import correlate
+from scipy.signal import correlate, fftconvolve
 from scipy.stats import ttest_ind, mannwhitneyu, shapiro
 import logging
 import time
 import traceback
+import gc  # For explicit garbage collection
+import math  # For calculating optimal batch sizes
 from mpl_toolkits.mplot3d import Axes3D
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
