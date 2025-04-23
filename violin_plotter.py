@@ -138,20 +138,20 @@ def compute_statistics(data1, data2):
     sig = significance_from_pval(pval)
     return pval, effect, method, sig
 
-def plot_violins(data_files, labels=None, output="comparative_violin_plots.png", title="Distribution Comparison", 
-              drop_outliers=0.0, outlier_method="percentile", show_pvalues=False, summary_table=False):
+def plot_violins(data_files, labels=None, drop_outliers=0.0, outlier_method="percentile", 
+              output="comparative_violin_plots.png", show_pvalues=False, summary_table=False, title="Distribution Comparison"):
     """
     Create violin plots for multiple datasets and calculate pairwise statistics.
     
-    Parameters:
+    Parameters (in alphabetical order):
         data_files: List of paths to data files
-        labels: Labels for each dataset
-        output: Path to save the output plot (default: "comparative_violin_plots.png")
-        title: Title for the plot
         drop_outliers: Threshold for removing low-value outliers
+        labels: Labels for each dataset
         outlier_method: Method for outlier detection ('percentile', 'zscore', or 'iqr')
+        output: Path to save the output plot (default: "comparative_violin_plots.png")
         show_pvalues: Whether to show p-values in addition to effect sizes
         summary_table: Whether to include a summary table of statistics below the plot
+        title: Title for the plot
     """
     # Load data
     datasets = []
@@ -291,24 +291,25 @@ def plot_violins(data_files, labels=None, output="comparative_violin_plots.png",
 def main():
     parser = argparse.ArgumentParser(description="Create violin plots comparing multiple distributions and calculate statistical significance.")
     
-    parser.add_argument("--files", required=True, 
-                        help="Comma-separated list of data files. Each file should contain one value per line.")
+    # Arguments in alphabetical order
     parser.add_argument("--data_labels", default=None,
                         help="Comma-separated labels for each dataset (must match number of files).")
-    parser.add_argument("--title", default="Distribution Comparison",
-                        help="Title for the plot.")
-    parser.add_argument("--output", default="comparative_violin_plots.png",
-                        help="Output file path. Default='comparative_violin_plots.png'.")
+    parser.add_argument("--display_only", action='store_true', default=False,
+                        help="Only display the plot without saving it. Default=False (plot is saved).")
     parser.add_argument("--drop_outliers", type=float, default=0.0,
                         help="Drop low-value outliers based on percentile or z-score. Values between 0-1 are treated as percentiles (e.g., 0.05 drops bottom 5%%). Values >1 are treated as z-score thresholds. Default=0.0 (no outlier removal).")
+    parser.add_argument("--files", required=True, 
+                        help="Comma-separated list of data files. Each file should contain one value per line.")
     parser.add_argument("--outlier_method", type=str, choices=['percentile', 'zscore', 'iqr'], default='percentile',
                         help="Method for detecting outliers: 'percentile', 'zscore', or 'iqr' (Interquartile Range). Default='percentile'.")
+    parser.add_argument("--output", default="comparative_violin_plots.png",
+                        help="Output file path. Default='comparative_violin_plots.png'.")
     parser.add_argument("--show_pvalues", action='store_true', default=False,
                         help="Show p-values in addition to effect sizes. By default, only effect sizes are shown.")
     parser.add_argument("--summary_table", action='store_true', default=False,
                         help="Include a summary table of statistics below the plot. Default=False.")
-    parser.add_argument("--display_only", action='store_true', default=False,
-                        help="Only display the plot without saving it. Default=False (plot is saved).")
+    parser.add_argument("--title", default="Distribution Comparison",
+                        help="Title for the plot.")
     
     args = parser.parse_args()
     
@@ -335,9 +336,17 @@ def main():
     # Output setting
     output_path = None if args.display_only else args.output
         
-    # Create plot
-    plot_violins(valid_files, labels, output_path, args.title, 
-                 args.drop_outliers, args.outlier_method, args.show_pvalues, args.summary_table)
+    # Create plot with parameters in alphabetical order
+    plot_violins(
+        data_files=valid_files,
+        drop_outliers=args.drop_outliers,
+        labels=labels,
+        outlier_method=args.outlier_method,
+        output=output_path,
+        show_pvalues=args.show_pvalues,
+        summary_table=args.summary_table,
+        title=args.title
+    )
 
 if __name__ == "__main__":
     main()
