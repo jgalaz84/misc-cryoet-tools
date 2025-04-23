@@ -47,18 +47,33 @@ def setup_logging(output_dir, verbose_level):
     log_file = os.path.join(output_dir, "run.log")
     if verbose_level <= 0:
         log_level = logging.ERROR
-    elif verbose_level == 1:
-        log_level = logging.WARNING
-    elif verbose_level == 2:
-        log_level = logging.INFO
+        # Set up a filter to only allow critical messages to stdout
+        class CriticalOnlyFilter(logging.Filter):
+            def filter(self, record):
+                return record.levelno >= logging.CRITICAL
+                
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.addFilter(CriticalOnlyFilter())
+        
+        handlers = [logging.FileHandler(log_file), stdout_handler]
     else:
-        log_level = logging.DEBUG
+        if verbose_level == 1:
+            log_level = logging.WARNING
+        elif verbose_level == 2:
+            log_level = logging.INFO
+        else:
+            log_level = logging.DEBUG
+        handlers = [logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+    
+    # Configure logging
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+        handlers=handlers
     )
-    logging.info("Command: " + " ".join(sys.argv))
+    
+    if verbose_level > 0:
+        logging.info("Command: " + " ".join(sys.argv))
     return log_file
 
 def parse_mrc_apix_and_mean(file_path):
@@ -880,10 +895,14 @@ def main():
                         help="Comma-separated labels for the datasets. Default='file1,file2'.")
     parser.add_argument('--diameter', type=float, default=None,
                         help="Minimum distance in voxels between final peaks. Default=None (auto-computed).")
+    parser.add_argument('--drop_outliers', type=float, default=0.0,
+                        help="Drop low-correlating outliers based on percentile or z-score. Values between 0-1 are treated as percentiles (e.g., 0.05 drops bottom 5%%). Values >1 are treated as z-score thresholds. Default=0.0 (no outlier removal).")
     parser.add_argument('--input', required=True,
                         help="Comma-separated input file paths (tomograms). Maximum 2 files allowed.")
     parser.add_argument('--npeaks', type=int, default=None,
                         help="Number of final peaks to keep per image. Default=None (auto-calculated).")
+    parser.add_argument('--outlier_method', type=str, choices=['percentile', 'zscore', 'iqr'], default='percentile',
+                        help="Method for detecting outliers: 'percentile', 'zscore', or 'iqr' (Interquartile Range). Default='percentile'.")
     parser.add_argument('--output_dir', default="cc_analysis",
                         help="Base name for output directory. Default='cc_analysis'.")
     parser.add_argument('--peak_method', type=str, default="original",
@@ -900,12 +919,6 @@ def main():
                         help="Number of processes to use in parallel. Default=1.")
     parser.add_argument('--verbose', type=int, default=2,
                         help="Verbosity level (0=ERROR,1=WARNING,2=INFO,3=DEBUG). Default=2.")
-    parser.add_argument('--process_all_images', action='store_true', default=True,
-                        help="Process all images in the input files. Default=True.")
-    parser.add_argument('--drop_outliers', type=float, default=0.0,
-                        help="Drop low-correlating outliers based on percentile or z-score. Values between 0-1 are treated as percentiles (e.g., 0.05 drops bottom 5%%). Values >1 are treated as z-score thresholds. Default=0.0 (no outlier removal).")
-    parser.add_argument('--outlier_method', type=str, choices=['percentile', 'zscore', 'iqr'], default='percentile',
-                        help="Method for detecting outliers: 'percentile', 'zscore', or 'iqr' (Interquartile Range). Default='percentile'.")
 
     args = parser.parse_args()
 
@@ -983,8 +996,8 @@ def main():
         # Use the already loaded images to avoid loading them again
         image_list = input_images[i]
         
-        # Process all images if process_all_images is True, otherwise just process save_coords_map images
-        processing_count = len(image_list) if args.process_all_images else min(args.save_coords_map, len(image_list))
+        # Process all images
+        processing_count = len(image_list)
         logging.info(f"Processing {processing_count} images from {file_path}")
         
         for img_idx, image_3d in enumerate(image_list[:processing_count]):
@@ -1142,22 +1155,53 @@ def main():
         avg_val = np.mean([p[3] for p in final_peaks]) if final_peaks else np.nan
         aggregated_avgs[filename].append((image_idx, avg_val))
 
-    # Write global aggregated results
+    # Write global aggregated results with various formats
     for filename, peaks in aggregated_ccs.items():
+        # 1. Full coordinates and values
         out_file = os.path.join(output_dir, f"ccs_{filename}.txt")
         with open(out_file, 'w') as f:
             for (x, y, z, val) in peaks:
                 f.write(f"{x}\t{y}\t{z}\t{val:.6f}\n")
-        logging.info(f"Saved aggregated CC peaks for file {filename} to {out_file}")
+        
+        # 2. Only CC values, sorted from highest to lowest (for easy distribution plotting)
+        values_only_file = os.path.join(output_dir, f"ccs_{filename}_values_only.txt")
+        with open(values_only_file, 'w') as f:
+            # Sort values from highest to lowest
+            sorted_values = sorted([p[3] for p in peaks], reverse=True)
+            for val in sorted_values:
+                f.write(f"{val:.6f}\n")
+        
+        # 3. Combined format with image index, coordinates, and values
+        detailed_file = os.path.join(output_dir, "raw_coordinates", f"ccs_{filename}_detailed.txt")
+        with open(detailed_file, 'w') as f:
+            f.write("Image_Index\tX\tY\tZ\tCC_Value\n")
+            for (filename_inner, img_idx), img_peaks in final_peaks_by_img.items():
+                if filename_inner == filename:  # Only include peaks from this file
+                    for (x, y, z, val) in img_peaks:
+                        f.write(f"{img_idx}\t{x}\t{y}\t{z}\t{val:.6f}\n")
+        
+        if args.verbose > 0:
+            logging.info(f"Saved CC peaks data for file {filename} in various formats")
 
-    # Write average CC
+    # Write average CC in multiple formats
     for filename, avg_list in aggregated_avgs.items():
+        # 1. Format with image indices
         out_file = os.path.join(output_dir, f"ccs_{filename}_avgs.txt")
         with open(out_file, 'w') as f:
             f.write("Image_Index\tAverage_CC\n")
             for (img_idx, av) in sorted(avg_list, key=lambda x: x[0]):
                 f.write(f"{img_idx}\t{av:.6f}\n")
-        logging.info(f"Saved average CC values for file {filename} to {out_file}")
+        
+        # 2. Only average values, sorted from highest to lowest
+        avgs_only_file = os.path.join(output_dir, f"ccs_{filename}_avgs_only.txt")
+        with open(avgs_only_file, 'w') as f:
+            # Sort values from highest to lowest
+            sorted_avgs = sorted([av for (_, av) in avg_list], reverse=True)
+            for av in sorted_avgs:
+                f.write(f"{av:.6f}\n")
+        
+        if args.verbose > 0:
+            logging.info(f"Saved average CC values for file {filename} in various formats")
 
     # Plot distributions
     if len(input_files) == 2:
