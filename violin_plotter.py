@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Author: Jesus Galaz-Montoya 07/2024; last modification: 08/2025
 
 import argparse
 import os
@@ -10,19 +11,27 @@ from itertools import combinations
 
 def load_data_file(file_path):
     """
-    Load data from a single-column text file.
-    The file should contain one value per line.
+    Load data from a text file that may have one or more numbers per line.
+    If a line has multiple numeric values (separated by whitespace or commas),
+    they’ll be averaged together. Non-numeric “header” lines are skipped.
     """
     values = []
     try:
         with open(file_path, 'r') as f:
             for line in f:
-                try:
-                    # Skip header lines if they can't be converted to float
-                    val = float(line.strip())
-                    values.append(val)
-                except ValueError:
+                parts = line.strip().replace(',', ' ').split()
+                nums = []
+                for p in parts:
+                    try:
+                        nums.append(float(p))
+                    except ValueError:
+                        # non-numeric token; skip it
+                        pass
+                if not nums:
+                    # no valid numbers on this line
                     continue
+                # average however many floats we found
+                values.append(sum(nums) / len(nums))
         return np.array(values)
     except Exception as e:
         print(f"Error loading file {file_path}: {e}")
